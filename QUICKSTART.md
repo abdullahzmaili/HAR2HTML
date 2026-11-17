@@ -7,7 +7,7 @@ In Edge or Chrome: open **DevTools (F12)** > **Network** > enable **Preserve log
 ## 2. Generate the report
 
 ```powershell
-.\Convert-HarToHtml.ps1 -HarPath "C:\temp\trace.har" -OutPut "C:\temp\Reports" -Open
+.\HAR2HTML.ps1 -HarPath "C:\temp\trace.har" -OutPut "C:\temp\Reports" -Open
 ```
 
 If `-OutPut` is omitted, the report is saved next to the HAR file. `-Open` opens it in the default browser.

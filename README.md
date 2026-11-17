@@ -47,17 +47,17 @@ flowchart LR
 
 **Basic:**
 ```powershell
-.\Convert-HarToHtml.ps1 -HarPath "C:\temp\trace.har"
+.\HAR2HTML.ps1 -HarPath "C:\temp\trace.har"
 ```
 
 **Choose the output folder and open the report when done:**
 ```powershell
-.\Convert-HarToHtml.ps1 -HarPath "C:\temp\trace.har" -OutPut "C:\temp\Reports" -Open
+.\HAR2HTML.ps1 -HarPath "C:\temp\trace.har" -OutPut "C:\temp\Reports" -Open
 ```
 
 **Mask secrets for sharing:**
 ```powershell
-.\Convert-HarToHtml.ps1 -HarPath "C:\temp\trace.har" -RedactSecrets
+.\HAR2HTML.ps1 -HarPath "C:\temp\trace.har" -RedactSecrets
 ```
 
 ## Parameters

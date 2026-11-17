@@ -1,9 +1,10 @@
 ﻿<#
 .SYNOPSIS
-HAR2HTML - converts a browser HAR trace into an interactive HTML report.
+HAR2HTML - converts a browser HAR trace or a Fiddler SAZ capture into an interactive HTML report.
 
 .DESCRIPTION
-This script reads a browser HAR trace (Edge, Chrome, Firefox or other HAR export), normalizes every entry, decodes request and
+This script reads a browser HAR trace (Edge, Chrome, Firefox or other HAR export) or a Fiddler .saz archive
+(sessions are converted to HAR-shaped entries in memory, including chunked bodies, timers and WebSocket frames), normalizes every entry, decodes request and
 response bodies (base64, gzip/deflate/brotli, URL-encoding, forms, multipart, JSON, XML, JWT, SAML, cookies,
 binary, WebSocket frames), detects common problems (AADSTS codes, CORS, expired JWTs, slow TTFB, ...) and
 embeds everything as JSON in a single HTML file. The report uses a classic HTTP debugging proxy layout
@@ -36,7 +37,7 @@ SECURITY NOTES:
 - Review and audit the generated HTML file before sharing it outside your organization.
 
 .PARAMETER HarPath
-Path to a single .har file. One HAR file is analyzed per run.
+Path to a single .har file or a Fiddler .saz archive (detected by extension or zip signature). One file is analyzed per run.
 
 .PARAMETER OutputPath
 Output HTML file or directory. Default: <HarName>_Report_<yyyyMMdd_HHmmss>.html next to the input.
@@ -53,6 +54,9 @@ when it is 20+ characters long (so error codes stay readable). _initiator data i
 
 .EXAMPLE
 .\HAR2HTML.ps1 -HarPath .\trace.har -OpenReport
+
+.EXAMPLE
+.\HAR2HTML.ps1 -HarPath .\FiddlerTrace.saz -OpenReport
 
 .EXAMPLE
 .\HAR2HTML.ps1 -HarPath .\trace.har -RedactSecrets -OutputPath C:\Reports
@@ -2309,7 +2313,7 @@ function exportHar(){
   const ents=viewEntries();
   const used=new Set(ents.map(e=>e.pageRef));
   const har={log:{version:'1.2',creator:{name:'HAR2HTML report export',version:'1.0'},pages:pagesMeta.filter(p=>used.has(p.id)).map(p=>({startedDateTime:str(p.startedDateTime),id:str(p.id),title:str(p.title),pageTimings:{}})),entries:ents.map(harEntry)}};
-  const base=str(meta.sourceFile).replace(/\.har$/i,'').replace(/[^\w.\-]/g,'_')||'report';
+  const base=str(meta.sourceFile).replace(/\.(har|saz)$/i,'').replace(/[^\w.\-]/g,'_')||'report';
   saveBlob(base+'_filtered.har','application/json',JSON.stringify(har,null,2));
 }
 
@@ -3893,7 +3897,7 @@ function ConvertTo-NormalizedEntry {
             if (-not $reqCt) { $reqCt = 'application/x-www-form-urlencoded' }
         }
     }
-    $reqRes = Expand-Body -Text $postText -IsBase64 $false -ContentType $reqCt -ContentEncoding ([string](Get-HeaderValue $reqHdrRaw 'content-encoding')) `
+    $reqRes = Expand-Body -Text $postText -IsBase64 ([string](Get-Prop $pd '_encoding' '') -eq 'base64') -ContentType $reqCt -ContentEncoding ([string](Get-HeaderValue $reqHdrRaw 'content-encoding')) `
         -DeclaredSize (Get-Num (Get-Prop $req 'bodySize' 0)) -CompressedSize 0 -Insights $ins -Side 'Request' -Redact $redact
     $reqBody = $reqRes.Model
 
@@ -4089,6 +4093,304 @@ function New-HarError {
 }
 #endregion
 
+#region Read-SazFile
+# Fiddler .saz archives (zip) hold one raw/NN_c.txt (request), NN_s.txt (response), NN_m.xml (metadata) and optionally
+# NN_w.txt (WebSocket) per session. They are converted in memory to HAR-shaped entries so the normal pipeline applies.
+function Find-BodyStart {
+    # Returns @{ HeaderEnd; BodyStart } for the first blank line in the raw message, or the whole buffer as headers.
+    param([byte[]]$Bytes, [int]$From = 0)
+    for ($i = $From; $i -lt $Bytes.Length - 1; $i++) {
+        if ($Bytes[$i] -eq 10) {
+            if ($Bytes[$i + 1] -eq 10) { return @{ HeaderEnd = $i; BodyStart = $i + 2 } }
+            if ($Bytes[$i + 1] -eq 13 -and $i + 2 -lt $Bytes.Length -and $Bytes[$i + 2] -eq 10) { return @{ HeaderEnd = $i; BodyStart = $i + 3 } }
+        }
+    }
+    return @{ HeaderEnd = $Bytes.Length; BodyStart = $Bytes.Length }
+}
+
+function Read-SazMessage {
+    # Splits a raw HTTP message into first line, headers and body bytes (chunked bodies are de-chunked).
+    param([byte[]]$Bytes)
+    $split = Find-BodyStart $Bytes
+    $head = [System.Text.Encoding]::UTF8.GetString($Bytes, 0, $split.HeaderEnd)
+    $lines = $head -split "\r?\n"
+    $headers = New-Object 'System.Collections.Generic.List[object]'
+    for ($i = 1; $i -lt $lines.Count; $i++) {
+        $ln = $lines[$i]
+        $ci = $ln.IndexOf(':')
+        if ($ci -gt 0) { $headers.Add([ordered]@{ name = $ln.Substring(0, $ci).Trim(); value = $ln.Substring($ci + 1).Trim() }) }
+    }
+    $bodyLen = $Bytes.Length - $split.BodyStart
+    $body = New-Object byte[] $bodyLen
+    if ($bodyLen -gt 0) { [System.Array]::Copy($Bytes, $split.BodyStart, $body, 0, $bodyLen) }
+    $te = ''
+    foreach ($h in $headers) { if ($h['name'] -ieq 'transfer-encoding') { $te = [string]$h['value'] } }
+    if ($te -match '(?i)chunked' -and $body.Length -gt 0) { $body = Expand-Chunked $body }
+    return @{ FirstLine = [string]$lines[0]; Headers = $headers.ToArray(); Body = $body }
+}
+
+function Expand-Chunked {
+    param([byte[]]$Data)
+    $ms = New-Object System.IO.MemoryStream
+    $pos = 0
+    while ($pos -lt $Data.Length) {
+        $eol = $pos
+        while ($eol -lt $Data.Length -and $Data[$eol] -ne 10) { $eol++ }
+        if ($eol -ge $Data.Length) { break }
+        $sizeText = [System.Text.Encoding]::ASCII.GetString($Data, $pos, $eol - $pos).Split(';')[0].Trim()
+        $size = 0
+        try { $size = [Convert]::ToInt32($sizeText, 16) } catch { return $Data }
+        $pos = $eol + 1
+        if ($size -eq 0) { break }
+        if ($pos + $size -gt $Data.Length) { $size = $Data.Length - $pos }
+        $ms.Write($Data, $pos, $size)
+        $pos += $size
+        if ($pos -lt $Data.Length -and $Data[$pos] -eq 13) { $pos++ }
+        if ($pos -lt $Data.Length -and $Data[$pos] -eq 10) { $pos++ }
+    }
+    return $ms.ToArray()
+}
+
+function ConvertFrom-SazTime {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text) -or $Text.StartsWith('0001-')) { return $null }
+    $d = [System.DateTimeOffset]::MinValue
+    if ([System.DateTimeOffset]::TryParse($Text, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { return $d }
+    return $null
+}
+
+function Get-SazBodyPayload {
+    # Text when the body is plain readable text, otherwise base64 (so compression and binary detection run in Expand-Body).
+    param([byte[]]$Bytes, [string]$ContentType, [string]$ContentEncoding)
+    if ($Bytes.Length -eq 0) { return @{ Text = $null; Encoding = '' } }
+    $asB64 = @{ Text = [System.Convert]::ToBase64String($Bytes); Encoding = 'base64' }
+    if ($ContentEncoding -and $ContentEncoding -notmatch '(?i)^\s*identity\s*$') { return $asB64 }
+    if ($ContentType -match '(?i)^\s*(image|audio|video|font)/|octet-stream|zip|pdf|protobuf|bond') { return $asB64 }
+    if ([System.Array]::IndexOf($Bytes, [byte]0) -ge 0) { return $asB64 }
+    try {
+        $start = 0
+        if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) { $start = 3 }
+        $txt = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($Bytes, $start, $Bytes.Length - $start)
+        return @{ Text = $txt; Encoding = '' }
+    } catch { return $asB64 }
+}
+
+function Read-SazWebSocket {
+    param([byte[]]$Bytes, $Fallback)
+    $msgs = New-Object 'System.Collections.Generic.List[object]'
+    $latin = [System.Text.Encoding]::GetEncoding(28591)
+    $pos = 0
+    while ($pos -lt $Bytes.Length) {
+        while ($pos -lt $Bytes.Length -and ($Bytes[$pos] -eq 13 -or $Bytes[$pos] -eq 10)) { $pos++ }
+        if ($pos -ge $Bytes.Length) { break }
+        $split = Find-BodyStart $Bytes $pos
+        $head = $latin.GetString($Bytes, $pos, $split.HeaderEnd - $pos)
+        $m = [regex]::Match($head, '(?im)^(Request|Response)-Length:\s*(\d+)')
+        if (-not $m.Success) { break }
+        $len = [int]$m.Groups[2].Value
+        if ($split.BodyStart + $len -gt $Bytes.Length) { $len = $Bytes.Length - $split.BodyStart }
+        $payload = New-Object byte[] $len
+        if ($len -gt 0) { [System.Array]::Copy($Bytes, $split.BodyStart, $payload, 0, $len) }
+        $pos = $split.BodyStart + $len
+        $when = $null
+        $tm = [regex]::Match($head, '(?im)^DoneRead:\s*(\S+)')
+        if ($tm.Success) { $when = ConvertFrom-SazTime $tm.Groups[1].Value }
+        if ($null -eq $when) { $when = $Fallback }
+        $p = Get-SazBodyPayload $payload '' ''
+        $isText = ($p.Encoding -ne 'base64')
+        $msgs.Add([ordered]@{
+                type = $(if ($m.Groups[1].Value -ieq 'Request') { 'send' } else { 'receive' })
+                time = $(if ($null -ne $when) { ($when.UtcDateTime - $script:Epoch).TotalSeconds } else { 0 })
+                opcode = $(if ($isText) { 1 } else { 2 })
+                data = $(if ($isText) { [string]$p.Text } else { $p.Text })
+            })
+    }
+    return $msgs
+}
+
+function ConvertFrom-SazSession {
+    param([string]$Id, [byte[]]$ReqBytes, [byte[]]$RespBytes, [string]$MetaXml, [byte[]]$WsBytes)
+    $flags = @{}
+    $timers = @{}
+    if ($MetaXml) {
+        try {
+            $rs = New-Object System.Xml.XmlReaderSettings
+            $rs.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+            $rs.XmlResolver = $null
+            $reader = [System.Xml.XmlReader]::Create((New-Object System.IO.StringReader($MetaXml)), $rs)
+            $doc = New-Object System.Xml.XmlDocument
+            $doc.XmlResolver = $null
+            try { $doc.Load($reader) } finally { $reader.Close() }
+            foreach ($n in $doc.SelectNodes('/Session/SessionFlags/SessionFlag')) { $flags[$n.GetAttribute('N').ToLowerInvariant()] = $n.GetAttribute('V') }
+            $tn = $doc.SelectSingleNode('/Session/SessionTimers')
+            if ($null -ne $tn) { foreach ($a in $tn.Attributes) { $timers[$a.Name] = $a.Value } }
+        } catch { Write-Warning ("Session {0}: metadata (_m.xml) could not be parsed: {1}" -f $Id, $_.Exception.Message) }
+    }
+    $T = { param($k) if ($timers.ContainsKey($k)) { return (ConvertFrom-SazTime $timers[$k]) } return $null }
+    $Num = { param($k) $d = 0.0; if ($timers.ContainsKey($k) -and [double]::TryParse($timers[$k], [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return $d } return 0.0 }
+    $Diff = { param($a, $b) if ($null -ne $a -and $null -ne $b) { $v = ($b - $a).TotalMilliseconds; if ($v -gt 0) { return $v } } return 0.0 }
+
+    $req = Read-SazMessage $ReqBytes
+    $rp = $req.FirstLine.Trim() -split '\s+', 3
+    if ($rp.Count -lt 2) { throw 'request line is malformed' }
+    $method = $rp[0].ToUpperInvariant()
+    $target = $rp[1]
+    $reqVer = ''
+    if ($rp.Count -ge 3) { $reqVer = $rp[2] }
+    $hostHdr = ''
+    foreach ($h in $req.Headers) { if ($h['name'] -ieq 'host') { $hostHdr = [string]$h['value'] } }
+    if ($method -eq 'CONNECT') {
+        $url = 'https://' + $target + '/'
+    } elseif ($target -match '^(?i)[a-z][a-z0-9+.\-]*://') {
+        $url = $target
+    } else {
+        $sch = 'http'
+        if ($flags.ContainsKey('https-client-version') -or $hostHdr -match ':443$') { $sch = 'https' }
+        if ($target.StartsWith('/')) { $url = $sch + '://' + $hostHdr + $target } else { $url = $sch + '://' + $hostHdr + '/' + $target }
+    }
+
+    $reqCt = ''
+    $reqCe = ''
+    foreach ($h in $req.Headers) {
+        if ($h['name'] -ieq 'content-type') { $reqCt = [string]$h['value'] }
+        if ($h['name'] -ieq 'content-encoding') { $reqCe = [string]$h['value'] }
+    }
+    $reqBody = $req.Body
+    if ($method -eq 'CONNECT') { $reqBody = [byte[]]@() }
+    $reqPayload = Get-SazBodyPayload $reqBody $reqCt $reqCe
+    $postData = $null
+    if ($reqBody.Length -gt 0) {
+        $postData = [ordered]@{ mimeType = $reqCt; text = $reqPayload.Text }
+        if ($reqPayload.Encoding) { $postData['_encoding'] = $reqPayload.Encoding }
+    }
+
+    $status = 0
+    $statusText = ''
+    $respVer = ''
+    $respHeaders = @()
+    $content = [ordered]@{ size = 0; mimeType = ''; text = $null }
+    $bodySize = 0
+    $errText = ''
+    if ($null -ne $RespBytes -and $RespBytes.Length -gt 0) {
+        $resp = Read-SazMessage $RespBytes
+        # Skip interim 1xx responses preceding the final one.
+        while ($resp.FirstLine -match '^HTTP/\S+\s+1\d\d\b' -and $resp.Body.Length -gt 0) { $resp = Read-SazMessage $resp.Body }
+        $sp = $resp.FirstLine.Trim() -split '\s+', 3
+        $respVer = $sp[0]
+        if ($sp.Count -ge 2) { [void][int]::TryParse($sp[1], [ref]$status) }
+        if ($sp.Count -ge 3) { $statusText = $sp[2] }
+        $respHeaders = $resp.Headers
+        $respCt = ''
+        $respCe = ''
+        foreach ($h in $respHeaders) {
+            if ($h['name'] -ieq 'content-type') { $respCt = [string]$h['value'] }
+            if ($h['name'] -ieq 'content-encoding') { $respCe = [string]$h['value'] }
+        }
+        $respBody = $resp.Body
+        if ($method -eq 'CONNECT') { $respBody = [byte[]]@() }
+        $bodySize = $respBody.Length
+        $pl = Get-SazBodyPayload $respBody $respCt $respCe
+        $content = [ordered]@{ size = $respBody.Length; mimeType = $respCt; text = $pl.Text }
+        if ($pl.Encoding) { $content['encoding'] = $pl.Encoding }
+    } else {
+        $errText = 'No response was captured by Fiddler for this session.'
+    }
+
+    $begin = & $T 'ClientBeginRequest'
+    if ($null -eq $begin) { $begin = & $T 'ClientConnected' }
+    if ($null -eq $begin) { $begin = & $T 'FiddlerBeginRequest' }
+    $endT = & $T 'ClientDoneResponse'
+    $total = & $Diff $begin $endT
+    $gotReq = & $T 'ServerGotRequest'
+    $beginResp = & $T 'ServerBeginResponse'
+    $doneResp = & $T 'ServerDoneResponse'
+    $timings = [ordered]@{
+        blocked = 0; dns = (& $Num 'DNSTime'); connect = (& $Num 'TCPConnectTime'); ssl = (& $Num 'HTTPSHandshakeTime')
+        send = (& $Diff (& $T 'FiddlerBeginRequest') $gotReq); wait = (& $Diff $gotReq $beginResp); receive = (& $Diff $beginResp $doneResp)
+    }
+
+    $entry = [ordered]@{}
+    if ($null -ne $begin) { $entry['startedDateTime'] = $begin.ToString('o') }
+    $entry['time'] = $total
+    $entry['request'] = [ordered]@{ method = $method; url = $url; httpVersion = $reqVer; headers = $req.Headers; bodySize = $reqBody.Length }
+    if ($null -ne $postData) { $entry['request']['postData'] = $postData }
+    $entry['response'] = [ordered]@{ status = $status; statusText = $statusText; httpVersion = $respVer; headers = $respHeaders; content = $content; bodySize = $bodySize }
+    $entry['timings'] = $timings
+    if ($flags.ContainsKey('x-hostip')) { $entry['serverIPAddress'] = $flags['x-hostip'] }
+    if ($flags.ContainsKey('x-clientport')) { $entry['connection'] = $flags['x-clientport'] }
+    if ($flags.ContainsKey('x-processinfo')) { $entry['_process'] = $flags['x-processinfo'] }
+    $entry['_fiddlerSession'] = $Id
+    if ($errText) { $entry['_error'] = $errText }
+    if ($null -ne $WsBytes -and $WsBytes.Length -gt 0) { $entry['_webSocketMessages'] = (Read-SazWebSocket $WsBytes $begin) }
+    return $entry
+}
+
+function Read-SazFile {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { New-HarError "SAZ file not found: $Path" 1 }
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    try { $zip = [System.IO.Compression.ZipFile]::OpenRead($Path) } catch { New-HarError ("Cannot open '$Path' as a SAZ archive (corrupted, password-protected or not a Fiddler file): " + $_.Exception.Message) 2 }
+    $entries = New-Object 'System.Collections.Generic.List[object]'
+    try {
+        $files = @{}
+        foreach ($z in $zip.Entries) {
+            if ($z.FullName -match '^raw/(\d+)_(c|s|w)\.txt$' -or $z.FullName -match '^raw/(\d+)_(m)\.xml$') { $files[$z.FullName.ToLowerInvariant()] = $z }
+        }
+        $ids = New-Object 'System.Collections.Generic.List[int]'
+        foreach ($k in $files.Keys) { if ($k -match '^raw/(\d+)_c\.txt$') { $ids.Add([int]$Matches[1]) } }
+        if ($ids.Count -eq 0) { New-HarError 'Invalid SAZ: no sessions (raw/NN_c.txt) were found in the archive.' 1 }
+        $ids.Sort()
+        $load = {
+            param($name)
+            $ze = $files[$name]
+            if ($null -eq $ze) { return $null }
+            if ($ze.Length -gt 268435456) { Write-Warning "$name is larger than 256 MB and was skipped."; return $null }
+            $ms = New-Object System.IO.MemoryStream
+            $st = $ze.Open()
+            try { $st.CopyTo($ms) } finally { $st.Dispose() }
+            return , $ms.ToArray()
+        }
+        $total = $ids.Count
+        $n = 0
+        foreach ($id in $ids) {
+            $n++
+            if ($total -gt 50 -and ($n % 25) -eq 0) { Write-Progress -Activity 'Reading SAZ' -Status ("Session {0} of {1}" -f $n, $total) -PercentComplete ([int](100 * $n / $total)) }
+            $pad = $id.ToString()
+            $stem = $null
+            foreach ($cand in @($id.ToString('00'), $pad)) { if ($files.ContainsKey("raw/${cand}_c.txt")) { $stem = $cand; break } }
+            if ($null -eq $stem) {
+                foreach ($k in $files.Keys) { if ($k -match '^raw/(0*)(\d+)_c\.txt$' -and [int]$Matches[2] -eq $id) { $stem = $Matches[1] + $Matches[2]; break } }
+            }
+            try {
+                $c = & $load "raw/${stem}_c.txt"
+                $s = & $load "raw/${stem}_s.txt"
+                $w = & $load "raw/${stem}_w.txt"
+                $mb = & $load "raw/${stem}_m.xml"
+                $mx = ''
+                if ($null -ne $mb) { $mx = (New-Object System.Text.UTF8Encoding($false)).GetString($mb).TrimStart([char]0xFEFF) }
+                if ($null -eq $c -or $c.Length -eq 0) { throw 'empty request file' }
+                $entries.Add((ConvertFrom-SazSession -Id $id.ToString() -ReqBytes $c -RespBytes $s -MetaXml $mx -WsBytes $w))
+            } catch {
+                Write-Warning ("Fiddler session #{0} skipped (malformed): {1}" -f $id, $_.Exception.Message)
+            }
+        }
+        Write-Progress -Activity 'Reading SAZ' -Completed
+    } finally { $zip.Dispose() }
+    return , ([ordered]@{ version = ''; creator = [ordered]@{ name = 'Fiddler (SAZ)'; version = '' }; entries = $entries.ToArray() })
+}
+
+function Test-SazFile {
+    param([string]$Path)
+    if ([System.IO.Path]::GetExtension($Path) -ieq '.saz') { return $true }
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try { $b = New-Object byte[] 4; $r = $fs.Read($b, 0, 4) } finally { $fs.Dispose() }
+        return ($r -eq 4 -and $b[0] -eq 0x50 -and $b[1] -eq 0x4B -and $b[2] -eq 3 -and $b[3] -eq 4)
+    } catch { return $false }
+}
+#endregion
+
 #region Read-HarFile
 function Read-HarFile {
     param([string]$Path)
@@ -4148,8 +4450,9 @@ function Invoke-HarConversion {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $leaf = [System.IO.Path]::GetFileName($InFile)
     Write-Verbose "Reading $InFile"
-    $log = Read-HarFile $InFile
-    Write-Stage $sw 'Stage 1/5: HAR read and validated'
+    $isSaz = Test-SazFile $InFile
+    if ($isSaz) { $log = Read-SazFile $InFile } else { $log = Read-HarFile $InFile }
+    Write-Stage $sw 'Stage 1/5: input read and validated'
 
     $rawEntries = Get-List (Get-Prop $log 'entries')
     $total = $rawEntries.Count
@@ -4163,6 +4466,7 @@ function Invoke-HarConversion {
         } catch {
             $skipped++
             Write-Warning ("Entry #{0} skipped (malformed): {1}" -f ($i + 1), $_.Exception.Message)
+            Write-Verbose $_.ScriptStackTrace
         }
         $rawEntries[$i] = $null
     }
@@ -4195,7 +4499,7 @@ function Invoke-HarConversion {
         title = $reportTitle
         sourceFile = $leaf
         generatedAt = (Format-IsoUtc ([System.DateTimeOffset]::UtcNow))
-        harVersion = [string](Get-Prop $log 'version' '')
+        harVersion = $(if ($isSaz) { 'n/a (Fiddler SAZ)' } else { [string](Get-Prop $log 'version' '') })
         creator = (& $nv $creator)
         browser = (& $nv $browser)
         captureStart = (& $iso $minMs)
@@ -4232,7 +4536,7 @@ function Invoke-HarSpecs {
     param([string]$Spec)
     $file = $null
     try {
-        if (-not (Test-Path -LiteralPath $Spec -PathType Leaf)) { New-HarError "HAR file not found: $Spec" 1 }
+        if (-not (Test-Path -LiteralPath $Spec -PathType Leaf)) { New-HarError "Input file not found: $Spec" 1 }
         $file = (Resolve-Path -LiteralPath $Spec).ProviderPath
     } catch {
         $code = 1

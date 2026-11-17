@@ -9,7 +9,7 @@
 ## Run
 
 ```powershell
-.\Convert-HarToHtml.ps1 -HarPath <file.har> [-OutPut <folder>] [-Open] [-RedactSecrets]
+.\HAR2HTML.ps1 -HarPath <file.har> [-OutPut <folder>] [-Open] [-RedactSecrets]
 ```
 
 If script execution is blocked, run once: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`
