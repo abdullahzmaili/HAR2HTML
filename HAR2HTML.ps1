@@ -1,10 +1,9 @@
 ﻿<#
 .SYNOPSIS
-HAR2HTML - converts a browser HAR trace or a Fiddler SAZ capture into an interactive HTML report.
+HAR2HTML - converts a browser HAR trace into an interactive HTML report.
 
 .DESCRIPTION
-This script reads a browser HAR trace (Edge, Chrome, Firefox or other HAR export) or a Fiddler .saz archive
-(sessions are converted to HAR-shaped entries in memory, including chunked bodies, timers and WebSocket frames), normalizes every entry, decodes request and
+This script reads a browser HAR trace (Edge, Chrome, Firefox or other HAR export), normalizes every entry, decodes request and
 response bodies (base64, gzip/deflate/brotli, URL-encoding, forms, multipart, JSON, XML, JWT, SAML, cookies,
 binary, WebSocket frames), detects common problems (AADSTS codes, CORS, expired JWTs, slow TTFB, ...) and
 embeds everything as JSON in a single HTML file. The report uses a classic HTTP debugging proxy layout
@@ -29,7 +28,8 @@ This script has been tested across various scenarios. However, by using it, you 
 
 SECURITY NOTES:
 - HAR content is untrusted. Every value rendered in the report is HTML-escaped (textContent / escapeHtml),
-  and the report uses a Content Security Policy and a sandboxed iframe for HTML previews to help prevent XSS.
+  and the report uses a Content Security Policy (only the report's own script, identified by hash, may run) and a
+  sandboxed iframe for HTML previews to help prevent XSS.
 - The script makes no network calls and sends no data anywhere; its only output is the HTML report file.
 - No credentials, tokens or access tokens are stored or validated. JWT signatures are never verified.
 - HAR files and generated reports may contain sensitive data (tokens, cookies, personal data). Use
@@ -37,26 +37,28 @@ SECURITY NOTES:
 - Review and audit the generated HTML file before sharing it outside your organization.
 
 .PARAMETER HarPath
-Path to a single .har file or a Fiddler .saz archive (detected by extension or zip signature). One file is analyzed per run.
+Path to a single .har file. One file is analyzed per run.
 
 .PARAMETER OutputPath
 Output HTML file or directory. Default: <HarName>_Report_<yyyyMMdd_HHmmss>.html next to the input.
 
-.PARAMETER OpenReport
+.PARAMETER Open
 Opens the finished report in the default browser.
 
 .PARAMETER RedactSecrets
-Masks Authorization/Cookie/Set-Cookie/X-Api-Key/Ocp-Apim-Subscription-Key headers and client_secret, password,
-code, access_token, refresh_token, id_token, SAMLResponse and assertion values (first and last 4 characters are
-kept, e.g. eyJ0****Xk2Q) in URLs, headers, cookies, query strings, form/JSON bodies, JWTs and SAML messages.
+Permanently masks secrets while the report is generated; the original values are never written to the HTML file and
+cannot be revealed afterwards. Without this switch the report contains all values unmasked.
+Masked: Authorization/Cookie/Set-Cookie/X-Api-Key/X-Auth-Token/X-Csrf-Token/X-Xsrf-Token/Ocp-Apim-Subscription-Key
+headers and client_secret, password, pwd, code, token, secret, api_key, access_token, refresh_token, id_token, sig,
+SAMLResponse, SAMLRequest and assertion values (also their camelCase forms) in URLs, headers, cookies, query strings,
+form/JSON/XML bodies, JWTs, SAML messages and the generated insight texts. Values of 12 characters or fewer, and all
+passwords and secrets, are fully masked; longer values keep a few characters at each end (at most 4, e.g.
+eyJ0****Xk2Q). Masking is name-based, so a secret stored under an unrecognised field name is not masked.
 Decoded JWT claims and SAML XML are withheld while redacting. In JSON bodies a "code" value is only masked
 when it is 20+ characters long (so error codes stay readable). _initiator data is dropped.
 
 .EXAMPLE
-.\HAR2HTML.ps1 -HarPath .\trace.har -OpenReport
-
-.EXAMPLE
-.\HAR2HTML.ps1 -HarPath .\FiddlerTrace.saz -OpenReport
+.\HAR2HTML.ps1 -HarPath .\trace.har -Open
 
 .EXAMPLE
 .\HAR2HTML.ps1 -HarPath .\trace.har -RedactSecrets -OutputPath C:\Reports
@@ -70,8 +72,7 @@ param(
     [Alias('Output', 'OutputFolder', 'OutDir')]
     [string]$OutputPath,
 
-    [Alias('Open')]
-    [switch]$OpenReport,
+    [switch]$Open,
 
     [switch]$RedactSecrets
 )
@@ -92,7 +93,7 @@ $script:HtmlTemplate = @'
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; frame-src blob: data:">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-__SCRIPT_HASH__'; img-src data: blob:; frame-src blob: data:; form-action 'none'; base-uri 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__REPORT_TITLE__</title>
 <style>
@@ -196,6 +197,10 @@ table.t tr.clk:hover td{background:var(--hov)}
 .note{padding:6px 8px;background:var(--warn);border:1px solid var(--warnbd);margin-bottom:6px;font-family:'Segoe UI',Tahoma,sans-serif}
 .empty{padding:14px;color:var(--mut);font-family:'Segoe UI',Tahoma,sans-serif;font-style:italic}
 mark{background:#ffff00;color:#000;padding:0}
+mark.cur{outline:2px solid #f57c00;outline-offset:0}
+.ifind{display:flex;align-items:center;gap:4px;background:var(--pane);border-bottom:1px solid var(--bd);padding:2px 6px;flex:none}
+.ifind input{flex:1;min-width:80px;max-width:380px}
+.ifind .fcnt{min-width:64px;color:var(--mut);font-family:'Segoe UI',Tahoma,sans-serif}
 .sec{margin:8px 0 3px;font-weight:700;font-family:'Segoe UI',Tahoma,sans-serif;background:var(--hd);padding:1px 6px;border:1px solid var(--bd)}
 .sec:first-child{margin-top:0}
 .tree{line-height:1.45}
@@ -238,7 +243,6 @@ body.dark .diffgrid tr.chg td{background:#5a4d10}body.dark .diffgrid tr.add td.b
 .chain .hop:hover{background:var(--hov)}
 .chain .hop.cur{border-color:var(--sel);box-shadow:inset 3px 0 0 var(--sel)}
 .chain .arrow{text-align:center;color:var(--mut)}
-.copybtn{height:18px;padding:0 5px;font-size:11px}
 </style>
 </head>
 <body>
@@ -264,7 +268,6 @@ body.dark .diffgrid tr.chg td{background:#5a4d10}body.dark .diffgrid tr.add td.b
     <button id="bCols" title="Choose columns">Columns &#9662;</button>
     <button id="bPages" title="Group sessions by page">Pages</button>
     <button id="bColors" title="Toggle row colours">Colours</button>
-    <button id="bRedact" title="Mask tokens, cookies and passwords on screen">Redact</button>
     <button id="bCompare" title="Compare selected session with the Ctrl+clicked one">Compare</button>
     <button id="bExport" title="Export">Export &#9662;</button>
     <button id="bDark" title="Dark mode">Dark</button>
@@ -403,9 +406,10 @@ function prep(e,i){
   e.respHeaders=Array.isArray(e.respHeaders)?e.respHeaders:[];
   e._ct=str(e.mimeType)||hget(e.respHeaders,'content-type');
   const cv=[];
-  if(e.correlation&&typeof e.correlation==='object'){for(const k in e.correlation){const v=str(e.correlation[k]);if(v)cv.push(v);}}
+  if(e.correlation&&typeof e.correlation==='object'){for(const k in e.correlation){if(!/correlation/i.test(k))continue;str(e.correlation[k]).split(/,\s*/).forEach(v=>{if(v&&cv.indexOf(v)<0)cv.push(v);});}}
   e._corr=cv.join(' ');
-  e._corr1=cv[0]||'';
+  e._corr1=cv.join(', ');
+  e._xms=e.correlation&&typeof e.correlation==='object'?str(e.correlation['x-ms-request-id']):'';
   let mx=0;
   (Array.isArray(e.insights)?e.insights:[]).forEach(x=>{const r=SEV[x&&x.severity]||1;if(r>mx)mx=r;});
   e._insMax=mx;
@@ -419,7 +423,7 @@ let firstMs=0;
 const idToIdx=new Map();
 E.forEach(e=>{if(!idToIdx.has(String(e.id)))idToIdx.set(String(e.id),e._i);});
 
-const UI=Object.assign({theme:'light',colors:true,redact:false,pages:false,tz:'Local',leftPx:0,reqFrac:0.5,vis:null,widths:{},order:null,wrap:false,jsonView:'tree'},LS.get('harui:v1',{}));
+const UI=Object.assign({theme:'light',colors:true,pages:false,tz:'Local',leftPx:0,reqFrac:0.5,vis:null,widths:{},order:null,wrap:false,jsonView:'tree'},LS.get('harui:v1',{}));
 const saveUI=()=>LS.set('harui:v1',UI);
 let marks=LS.get(RK+':marks',{});
 const saveMarks=()=>LS.set(RK+':marks',marks);
@@ -439,6 +443,7 @@ const COLS=[
  {k:'ip',l:'Server IP',w:100},
  {k:'cache',l:'Cache',w:60},
  {k:'corr',l:'Correlation ID',w:170},
+ {k:'xms',l:'x-ms-request-id',w:170},
  {k:'ins',l:'!',w:26,al:'c'}
 ];
 const COLBY={};COLS.forEach(c=>COLBY[c.k]=c);
@@ -448,39 +453,6 @@ COLS.forEach(c=>{if(c.req&&UI.vis.indexOf(c.k)<0)UI.vis.push(c.k);});
 if(!Array.isArray(UI.order)||UI.order.length!==COLS.length||COLS.some(c=>UI.order.indexOf(c.k)<0))UI.order=COLS.map(c=>c.k);
 const colW=k=>num(UI.widths[k])||COLBY[k].w;
 const visCols=()=>UI.order.filter(k=>UI.vis.indexOf(k)>=0);
-
-/* ---------- redaction (display only) ---------- */
-const SENS_H=/^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|ocp-apim-subscription-key|x-auth-token|x-csrf-token)$/i;
-const SENS_K=/^(client_secret|password|passwd|pwd|code|access_token|refresh_token|id_token|samlresponse|samlrequest|assertion|client_assertion|token|secret|api[_-]?key)$/i;
-function mask(s){s=str(s);if(s.length<=8)return '****';return s.slice(0,4)+'****'+s.slice(-4);}
-function redactHeader(name,value){
-  if(!UI.redact)return value;
-  value=str(value);
-  if(/^(set-)?cookie$/i.test(name)){
-    return value.split(/;\s*/).map((p,i)=>{
-      const q=p.indexOf('=');
-      if(q<0)return p;
-      const k=p.slice(0,q);
-      if(/^(domain|path|expires|max-age|samesite|secure|httponly|priority|partitioned)$/i.test(k))return p;
-      return k+'='+mask(p.slice(q+1));
-    }).join('; ');
-  }
-  if(SENS_H.test(name)){
-    const m=/^(Bearer|Basic|Negotiate|NTLM|Digest)\s+(.+)$/i.exec(value);
-    return m?m[1]+' '+mask(m[2]):mask(value);
-  }
-  return value;
-}
-function redactVal(name,value){return UI.redact&&SENS_K.test(name)?mask(value):value;}
-function redactText(s){
-  if(!UI.redact||!s)return s;
-  s=String(s);
-  s=s.replace(/eyJ[\w-]{6,}\.[\w-]{6,}\.[\w-]*/g,m=>mask(m));
-  s=s.replace(/([?&;\s]|^)(client_secret|password|passwd|code|access_token|refresh_token|id_token|SAMLResponse|SAMLRequest|assertion|client_assertion)=([^&\s"'<>]+)/gi,(m,a,b,c)=>a+b+'='+mask(c));
-  s=s.replace(/("(?:client_secret|password|passwd|access_token|refresh_token|id_token|assertion|SAMLResponse|code|client_assertion)"\s*:\s*")([^"]*)(")/gi,(m,a,b,c)=>a+mask(b)+c);
-  s=s.replace(/(<(?:saml2?p?:)?(?:Assertion|SAMLResponse)\b[^>]*>)([\s\S]{20,}?)(<\/)/gi,(m,a,b,c)=>a+mask(b)+c);
-  return s;
-}
 
 /* ---------- time ---------- */
 function fmtTime(e){
@@ -622,10 +594,11 @@ function colText(e,k){
     case 'rtype':return str(e.resourceType);
     case 'ip':return str(e.serverIp);
     case 'cache':return e._cache;
+    case 'xms':return e._xms;
   }
   return '';
 }
-const TEXTCOLS=['num','host','proto','url','ctype','rtype','ip','cache','corr'];
+const TEXTCOLS=['num','host','proto','url','ctype','rtype','ip','cache','corr','xms'];
 function compileFilters(){
   const tf=[];
   TEXTCOLS.forEach(k=>{
@@ -732,7 +705,6 @@ function applyView(){
   renderGrid(true);
   updateStatus();
   updateCounter();
-  panelsDirty=true;
   if(leftTab!=='sessions')renderPanel(leftTab);
 }
 const viewEntries=()=>view.filter(i=>i>=0).map(i=>E[i]);
@@ -765,7 +737,7 @@ function cellText(e,k){
     case 'status':return e._status?String(e._status):(e._fail?'0':'');
     case 'host':return str(e.host);
     case 'proto':return str(e.httpVersion);
-    case 'url':return redactText(e.url);
+    case 'url':return e.url;
     case 'ctype':return e._ct;
     case 'rtype':return str(e.resourceType);
     case 'size':return fmtBytes(e._size)+(e._xfer>=0?' / '+fmtBytes(e._xfer):'');
@@ -773,6 +745,7 @@ function cellText(e,k){
     case 'ip':return str(e.serverIp);
     case 'cache':return e._cache;
     case 'corr':return e._corr1;
+    case 'xms':return e._xms;
   }
   return '';
 }
@@ -1051,7 +1024,7 @@ function updateSessbar(){
   const info=$('#sbInfo'),mk=$('#sbMark'),nt=$('#sbNote');
   if(!e){info.textContent='No session selected';mk.value='';nt.value='';mk.disabled=nt.disabled=true;return;}
   mk.disabled=nt.disabled=false;
-  info.textContent='#'+e.id+'  '+e.method+'  '+(e._status||'0')+'  '+redactText(e.url);
+  info.textContent='#'+e.id+'  '+e.method+'  '+(e._status||'0')+'  '+e.url;
   info.title=e.url;
   const m=marks[e.id]||{};
   mk.value=m.c||'';
@@ -1130,7 +1103,8 @@ function openCtx(x,y,e){
   m.textContent='';
   const item=(label,fn,dis)=>m.appendChild(el('div',{class:'mi'+(dis?' dis':''),onclick:()=>{m.style.display='none';fn();}},label));
   item('Copy URL',()=>copyText(e.url));
-  item('Copy as cURL',()=>copyText(asCurl(e)));
+  item('Copy as cURL (bash)',()=>copyText(asCurl(e,false)));
+  item('Copy as cURL (PowerShell)',()=>copyText(asCurl(e,true)));
   item('Copy as PowerShell (Invoke-WebRequest)',()=>copyText(asPowerShell(e)));
   item('Copy correlation IDs',()=>copyText(corrText(e)||'(none)'));
   m.appendChild(el('hr'));
@@ -1224,7 +1198,7 @@ function bodyView(e,kind,mode){
     return out;
   }
   let t=mode==='raw'?str(b.raw):(str(b.decoded)!==''?str(b.decoded):(isBin(b)?'':str(b.raw)));
-  if(t!==''){out.text=redactText(t);return out;}
+  if(t!==''){out.text=t;return out;}
   if(isBin(b)){out.msg='Binary content ('+fmtBytes(b.size||0)+'). See the Hex tab'+(kind==='resp'?' or Preview':'')+'.';out.bin=true;return out;}
   const size=num(b.size);
   if(kind==='req')out.msg=size>0?NOCAP:'No request body.';
@@ -1235,7 +1209,7 @@ function bodyView(e,kind,mode){
 function textBox(text,re){
   const w=el('div');
   let t=text;
-  if(t.length>CAP){w.appendChild(note('Showing the first '+CAP.toLocaleString()+' of '+t.length.toLocaleString()+' characters. Use Download for the complete body.'));t=t.slice(0,CAP);}
+  if(t.length>CAP){w.appendChild(note('Showing the first '+CAP.toLocaleString()+' of '+t.length.toLocaleString()+' characters.'));t=t.slice(0,CAP);}
   const pre=el('pre');
   appendHL(pre,t,re);
   w.appendChild(pre);
@@ -1350,7 +1324,7 @@ function hdrGroup(n){
 /* ---------- tab renderers ---------- */
 function rawRequestText(e,mode){
   const lines=[e.method+' '+pathQ(e)+' '+(str(e.httpVersion)||'HTTP/1.1')];
-  e.reqHeaders.forEach(h=>lines.push(str(h.name)+': '+redactHeader(str(h.name),str(h.value))));
+  e.reqHeaders.forEach(h=>lines.push(str(h.name)+': '+str(h.value)));
   const bv=bodyView(e,'req',mode);
   let s=lines.join('\r\n')+'\r\n\r\n';
   if(bv.text)s+=bv.text;else if(bv.bin)s+='[binary body, '+fmtBytes(bv.b&&bv.b.size)+']';
@@ -1358,7 +1332,7 @@ function rawRequestText(e,mode){
 }
 function rawResponseText(e,mode){
   const lines=[(str(e.httpVersion)||'HTTP/1.1')+' '+(e._status||0)+' '+str(e.statusText)];
-  e.respHeaders.forEach(h=>lines.push(str(h.name)+': '+redactHeader(str(h.name),str(h.value))));
+  e.respHeaders.forEach(h=>lines.push(str(h.name)+': '+str(h.value)));
   const bv=bodyView(e,'resp',mode);
   let s=lines.join('\r\n')+'\r\n\r\n';
   if(bv.text)s+=bv.text;else if(bv.bin)s+='[binary body, '+fmtBytes(bv.b&&bv.b.size)+']';
@@ -1371,14 +1345,14 @@ function tHeaders(e,ctx){
   let copy='';
   const gen=[];
   if(kind==='req'){
-    gen.push(['Request',e.method+' '+redactText(pathQ(e))+' '+str(e.httpVersion)]);
-    gen.push(['URL',redactText(e.url)]);
+    gen.push(['Request',e.method+' '+pathQ(e)+' '+str(e.httpVersion)]);
+    gen.push(['URL',e.url]);
   }else{
     gen.push(['Status',str(e.httpVersion)+' '+(e._status||0)+' '+str(e.statusText)]);
     if(e.error)gen.push(['Error',e.error]);
     if(e._ct)gen.push(['Content-Type',e._ct]);
     gen.push(['Body size',fmtBytes(e._size)+(e._xfer>=0?' (transfer '+fmtBytes(e._xfer)+')':'')]);
-    if(e.redirectURL)gen.push(['Redirect to',redactText(e.redirectURL)]);
+    if(e.redirectURL)gen.push(['Redirect to',e.redirectURL]);
   }
   if(e.serverIp)gen.push(['Server IP',e.serverIp]);
   if(e.connection)gen.push(['Connection',e.connection]);
@@ -1392,7 +1366,7 @@ function tHeaders(e,ctx){
   if(!list.length){root.appendChild(empty('No headers captured.'));ctx.copy=copy;return root;}
   const by={};
   GROUPS.forEach(g=>by[g]=[]);
-  list.forEach(h=>by[hdrGroup(str(h&&h.name))].push([str(h&&h.name),redactHeader(str(h&&h.name),str(h&&h.value))]));
+  list.forEach(h=>by[hdrGroup(str(h&&h.name))].push([str(h&&h.name),str(h&&h.value)]));
   GROUPS.forEach(g=>{
     if(!by[g].length)return;
     by[g].sort((a,b)=>a[0].toLowerCase()<b[0].toLowerCase()?-1:1);
@@ -1457,7 +1431,7 @@ function tWebForms(e,ctx){
   let copy='';
   if(q.length){
     any=true;root.appendChild(sec('Query string'));
-    root.appendChild(gridTable(['Name','Value'],q.map(p=>[str(p.name),redactVal(str(p.name),str(p.value))]),reU));
+    root.appendChild(gridTable(['Name','Value'],q.map(p=>[str(p.name),str(p.value)]),reU));
     copy+=q.map(p=>str(p.name)+'='+str(p.value)).join('\n')+'\n';
   }
   const rb=e.reqBody||{};
@@ -1467,14 +1441,14 @@ function tWebForms(e,ctx){
   }
   if(params.length){
     any=true;root.appendChild(sec('Form body (application/x-www-form-urlencoded)'));
-    root.appendChild(gridTable(['Name','Value'],params.map(p=>[str(p.name),redactVal(str(p.name),str(p.value))]),reB));
+    root.appendChild(gridTable(['Name','Value'],params.map(p=>[str(p.name),str(p.value)]),reB));
     copy+=params.map(p=>str(p.name)+'='+str(p.value)).join('\n')+'\n';
   }
   if(Array.isArray(rb.parts)&&rb.parts.length){
     any=true;root.appendChild(sec('Multipart parts'));
     root.appendChild(gridTable(['Name','File name','Content-Type','Size','Content'],rb.parts.map(p=>{
       const tx=str(p&&p.text);
-      return [str(p&&p.name),str(p&&p.filename),str(p&&p.contentType),p&&p.size!=null?fmtBytes(p.size):'',tx?redactText(tx.length>600?tx.slice(0,600)+'\u2026':tx):(p&&p.filename?'(file content not shown)':'')];
+      return [str(p&&p.name),str(p&&p.filename),str(p&&p.contentType),p&&p.size!=null?fmtBytes(p.size):'',tx?(tx.length>600?tx.slice(0,600)+'\u2026':tx):(p&&p.filename?'(file content not shown)':'')];
     }),reB));
   }
   if(!any)root.appendChild(empty('No query string, form or multipart data.'));
@@ -1492,22 +1466,22 @@ function tCookies(e,ctx){
     let c=Array.isArray(e.reqCookies)?e.reqCookies:[];
     if(!c.length)c=parseCookieHeader(hget(e.reqHeaders,'cookie'));
     if(!c.length){root.appendChild(empty('No request cookies.'));return root;}
-    root.appendChild(gridTable(['Name','Value'],c.map(x=>[str(x.name),UI.redact?mask(x.value):str(x.value)]),re));
-    copy=c.map(x=>str(x.name)+'='+(UI.redact?mask(x.value):str(x.value))).join('\n');
+    root.appendChild(gridTable(['Name','Value'],c.map(x=>[str(x.name),str(x.value)]),re));
+    copy=c.map(x=>str(x.name)+'='+str(x.value)).join('\n');
   }else{
     const c=Array.isArray(e.respCookies)?e.respCookies:[];
     if(!c.length){
       const sc=e.respHeaders.filter(h=>/^set-cookie$/i.test(str(h.name)));
       if(!sc.length){root.appendChild(empty('No Set-Cookie headers.'));return root;}
-      root.appendChild(gridTable(['Set-Cookie'],sc.map(h=>[redactHeader('set-cookie',str(h.value))]),re));
-      copy=sc.map(h=>redactHeader('set-cookie',str(h.value))).join('\n');
+      root.appendChild(gridTable(['Set-Cookie'],      sc.map(h=>[str(h.value)]),re));
+            copy=sc.map(h=>str(h.value)).join('\n');
     }else{
       root.appendChild(gridTable(['Name','Value','Domain','Path','Expires','Secure','HttpOnly','SameSite'],c.map(x=>{
         const ss=str(x.sameSite);
         const bad=/^none$/i.test(ss)&&!x.secure;
-        return [str(x.name),UI.redact?mask(x.value):str(x.value),str(x.domain),str(x.path),str(x.expires),x.secure?'Secure':'',x.httpOnly?'HttpOnly':'',bad?ss+' \u26A0 without Secure':ss];
+        return [str(x.name),str(x.value),str(x.domain),str(x.path),str(x.expires),x.secure?'Secure':'',x.httpOnly?'HttpOnly':'',bad?ss+' \u26A0 without Secure':ss];
       }),re));
-      copy=c.map(x=>str(x.name)+'='+(UI.redact?mask(x.value):str(x.value))).join('\n');
+      copy=c.map(x=>str(x.name)+'='+str(x.value)).join('\n');
     }
   }
   ctx.copy=copy;
@@ -1526,7 +1500,7 @@ function jwtCard(j,e,re){
     exp!=null||j.expired!=null?el('span',{class:'badge '+(expired?'bad':'good')},expired?'EXPIRED':'not expired'):null));
   const b=el('div',{class:'jb'});
   const tk=el('div',{class:'mono',style:'word-break:break-all;margin-bottom:5px;color:var(--mut)'});
-  appendHL(tk,UI.redact?mask(tok):tok,re);
+  appendHL(tk,tok,re);
   b.appendChild(tk);
   const rows=[];
   PROM.forEach(k=>{if(p[k]!==undefined)rows.push([k,claimStr(p[k])]);});
@@ -1553,8 +1527,8 @@ function tAuth(e,ctx){
   if(kind==='req'&&a.oauthParams&&Object.keys(a.oauthParams).length){
     root.appendChild(sec('OAuth / OIDC parameters'));
     const ks=Object.keys(a.oauthParams).sort((x,y)=>{const i=OAUTH_ORDER.indexOf(x),j=OAUTH_ORDER.indexOf(y);return (i<0?99:i)-(j<0?99:j);});
-    root.appendChild(kvTable(ks.map(k=>[k,redactVal(k,claimStr(a.oauthParams[k]))]),re));
-    copy+=ks.map(k=>k+'='+redactVal(k,claimStr(a.oauthParams[k]))).join('\n')+'\n';
+    root.appendChild(kvTable(ks.map(k=>[k,claimStr(a.oauthParams[k])]),re));
+    copy+=ks.map(k=>k+'='+claimStr(a.oauthParams[k])).join('\n')+'\n';
   }
   if(jw.length){
     root.appendChild(sec('Decoded JWT tokens ('+jw.length+')'));
@@ -1578,13 +1552,13 @@ function tSaml(e,ctx){
     if(rows.length)b.appendChild(kvTable(rows,re));
     if(Array.isArray(s.attributes)&&s.attributes.length){
       b.appendChild(sec('Attributes'));
-      b.appendChild(gridTable(['Name','Value'],s.attributes.map(x=>[str(x.name),redactVal(str(x.name),str(x.value))]),re));
+      b.appendChild(gridTable(['Name','Value'],s.attributes.map(x=>[str(x.name),str(x.value)]),re));
     }
     const xml=str(s.xml);
     if(xml){
       b.appendChild(sec('XML'));
       const f=xml.length<CAP&&looksXml(xml)?formatXml(xml):xml;
-      const pre=el('pre');appendHL(pre,UI.redact?redactText(f):f,re);b.appendChild(pre);
+      const pre=el('pre');appendHL(pre,f,re);b.appendChild(pre);
       copy+=f+'\n';
     }
     card.appendChild(b);root.appendChild(card);
@@ -1608,7 +1582,7 @@ function tHex(e,ctx){
   if(!u||!u.length)return empty(bodyView(e,ctx.kind,ctx.mode).msg||'No body data.');
   const root=el('div');
   const cap=262144;
-  root.appendChild(note(u.length.toLocaleString()+' bytes'+(u.length>cap?'. Showing the first '+cap.toLocaleString()+' bytes; use Download for the full body.':'.')));
+  root.appendChild(note(u.length.toLocaleString()+' bytes'+(u.length>cap?'. Showing the first '+cap.toLocaleString()+' bytes.':'.')));
   const t=hexDump(u,cap);
   ctx.copy=t;
   root.appendChild(el('pre',null,t));
@@ -1624,7 +1598,7 @@ function imgDataUri(e){
   if(mime==='image/svg+xml'&&str(b.decoded))return 'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(str(b.decoded));
   return '';
 }
-function tPreview(e,ctx){
+function tPreview(e){
   const root=el('div');
   const mt=str(e.mimeType).toLowerCase();
   if(e.resourceType==='image'||/^image\//.test(mt)){
@@ -1639,7 +1613,7 @@ function tPreview(e,ctx){
   if((b.format==='html'||/html/.test(mt))&&str(b.decoded)!==''){
     root.appendChild(note('Sandboxed preview: scripts, forms and external resources are disabled.'));
     const f=el('iframe',{sandbox:'',title:'HTML preview',style:'width:100%;height:calc(100% - 50px);min-height:240px;border:1px solid var(--bd);background:#fff'});
-    f.srcdoc=redactText(str(b.decoded));
+    f.srcdoc=str(b.decoded);
     root.appendChild(f);
     return root;
   }
@@ -1716,14 +1690,14 @@ function tRedirects(e,ctx){
   chain.forEach((i,k)=>{
     const x=E[i];
     if(k)root.appendChild(el('div',{class:'arrow'},'\u2193'));
-    const hop=el('div',{class:'hop'+(i===e._i?' cur':'')},el('b',null,'#'+x.id+'  '+x.method+'  '+(x._status||0)+'  '),redactText(x.url));
+    const hop=el('div',{class:'hop'+(i===e._i?' cur':'')},el('b',null,'#'+x.id+'  '+x.method+'  '+(x._status||0)+'  '),x.url);
     hop.addEventListener('click',()=>{if(i!==selI)select(i,{now:true});});
     root.appendChild(hop);
     copy+=(k+1)+'. #'+x.id+' '+x.method+' '+x._status+' '+x.url+'\n';
   });
   if(lastT&&RG.nxt[last._i]<0){
     root.appendChild(el('div',{class:'arrow'},'\u2193'));
-    root.appendChild(el('div',{class:'hop',style:'cursor:default'},'\u2192 '+redactText(lastT)+'  (target not present in this capture)'));
+    root.appendChild(el('div',{class:'hop',style:'cursor:default'},'\u2192 '+lastT+'  (target not present in this capture)'));
     copy+='-> '+lastT+'\n';
   }
   ctx.copy=copy;
@@ -1768,7 +1742,7 @@ function tWebSocket(e,ctx){
     let tm=num(x&&x.time);
     if(tm>0&&tm<1e11)tm*=1000;
     const ty=str(x&&x.type);
-    return [/send/i.test(ty)?'\u2B06 send':/receive/i.test(ty)?'\u2B07 receive':ty,tm?fmtTs(tm,UI.tz==='UTC'?'UTC':'Local'):'',str(x&&x.opcode),redactText(d)];
+    return [/send/i.test(ty)?'\u2B06 send':/receive/i.test(ty)?'\u2B07 receive':ty,tm?fmtTs(tm,UI.tz==='UTC'?'UTC':'Local'):'',str(x&&x.opcode),d];
   });
   ctx.copy=rows.map(r=>r.join('\t')).join('\n');
   return gridTable(['Direction','Time','Opcode','Data'],rows,re);
@@ -1824,28 +1798,10 @@ function tabCount(e,kind,tab,mode){
   const re=hlRe(scope);
   return re?countMatches(text,re):0;
 }
-function downloadName(e,kind){
-  const b=getBody(e,kind)||{};
-  let seg='body';
-  try{seg=new URL(e.url).pathname.split('/').filter(Boolean).pop()||str(e.host)||'body';}catch(err){}
-  seg=seg.replace(/[^\w.\-]/g,'_').slice(0,60)||'body';
-  if(/\.\w{1,5}$/.test(seg))return seg;
-  const mt=str(kind==='resp'?e.mimeType:'').toLowerCase();
-  const ext=b.format==='json'?'.json':b.format==='xml'?'.xml':b.format==='html'?'.html':/png/.test(mt)?'.png':/jpe?g/.test(mt)?'.jpg':/gif/.test(mt)?'.gif':/webp/.test(mt)?'.webp':/pdf/.test(mt)?'.pdf':b.format==='binary'?'.bin':'.txt';
-  return seg+ext;
-}
-function downloadBody(e,kind,mode){
-  const bv=bodyView(e,kind,mode);
-  const b=getBody(e,kind);
-  if(!b||(bv.msg&&!bv.bin)){toast('No body to download');return;}
-  let u=null;
-  if(isBin(b)||!bv.text){try{u=bodyBytes(e,kind,mode);}catch(err){}}
-  if(u)saveBlob(downloadName(e,kind),'application/octet-stream',u);
-  else saveBlob(downloadName(e,kind),'text/plain;charset=utf-8',bv.text);
-}
 
 /* ---------- inspector ---------- */
 const INSPS=[];
+const FIND_MAX=2000;
 function makeInspector(kind,host){
   const tabs=kind==='req'?REQ_TABS:RESP_TABS;
   let cur=LS.get('harui:tab:'+kind,'headers');
@@ -1854,19 +1810,81 @@ function makeInspector(kind,host){
   const bCopy=el('button',{title:'Copy this view'},'Copy');
   const bWrap=el('button',{title:'Word wrap on/off'},'Wrap');
   const bMode=el('button',{title:'Switch between raw and decoded body'},'Show raw');
-  const bDl=el('button',{title:'Download the body'},'Download');
   const body=el('div',{class:'ibody',tabindex:'0'});
-  host.appendChild(el('div',{class:'ihead'},el('span',{class:'nm'},kind==='req'?'Request':'Response'),tabsEl,el('div',{class:'ibtns'},bCopy,bWrap,bMode,bDl)));
+  host.appendChild(el('div',{class:'ihead'},el('span',{class:'nm'},kind==='req'?'Request':'Response'),tabsEl,el('div',{class:'ibtns'},bCopy,bWrap,bMode)));
+  const fIn=el('input',{type:'text',placeholder:'Find in '+(kind==='req'?'request':'response')+'...',title:'Find text in the current view. Enter = next, Shift+Enter = previous, Esc = clear.'});
+  const fPrev=el('button',{title:'Previous match'},'\u25B2');
+  const fNext=el('button',{title:'Next match'},'\u25BC');
+  const fCnt=el('span',{class:'fcnt'});
+  host.appendChild(el('div',{class:'ifind'},fIn,fPrev,fNext,fCnt));
   host.appendChild(body);
+  let fMarks=[],fCur=-1,fTimer=0;
+  function clearFind(){
+    const ps=new Set();
+    fMarks.forEach(m=>{const p=m.parentNode;if(!p)return;p.replaceChild(document.createTextNode(m.textContent),m);ps.add(p);});
+    ps.forEach(p=>p.normalize());
+    fMarks=[];fCur=-1;
+  }
+  function goFind(i){
+    if(!fMarks.length)return;
+    if(fCur>=0&&fMarks[fCur])fMarks[fCur].classList.remove('cur');
+    fCur=(i+fMarks.length)%fMarks.length;
+    const m=fMarks[fCur];
+    for(let p=m.parentElement;p&&p!==body;p=p.parentElement){
+      if(p.style.display==='none'&&p.previousElementSibling){const tg=p.previousElementSibling.querySelector('.tg');if(tg)tg.click();}
+    }
+    m.classList.add('cur');
+    m.scrollIntoView({block:'center',inline:'nearest'});
+    fCnt.textContent=(fCur+1)+' / '+fMarks.length+(fMarks.length>=FIND_MAX?'+':'');
+  }
+  function applyFind(){
+    clearFind();
+    fCnt.textContent='';
+    const q=fIn.value;
+    if(!q||!curE)return;
+    const re=new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi');
+    const walker=document.createTreeWalker(body,NodeFilter.SHOW_TEXT,null);
+    const nodes=[];
+    let n;
+    while((n=walker.nextNode()))nodes.push(n);
+    for(const tn of nodes){
+      if(fMarks.length>=FIND_MAX)break;
+      const t=tn.nodeValue;
+      re.lastIndex=0;
+      let m=re.exec(t);
+      if(!m)continue;
+      const frag=document.createDocumentFragment();
+      let last=0;
+      while(m&&fMarks.length<FIND_MAX){
+        if(m.index>last)frag.appendChild(document.createTextNode(t.slice(last,m.index)));
+        const mk=el('mark',{class:'f'},m[0]);
+        frag.appendChild(mk);
+        fMarks.push(mk);
+        last=m.index+m[0].length;
+        m=re.exec(t);
+      }
+      if(last<t.length)frag.appendChild(document.createTextNode(t.slice(last)));
+      tn.parentNode.replaceChild(frag,tn);
+    }
+    if(!fMarks.length){fCnt.textContent='No matches';return;}
+    goFind(0);
+  }
+  fIn.addEventListener('input',()=>{clearTimeout(fTimer);fTimer=setTimeout(applyFind,150);});
+  fIn.addEventListener('keydown',ev=>{
+    if(ev.key==='Enter'){ev.preventDefault();clearTimeout(fTimer);if(fMarks.length)goFind(fCur+(ev.shiftKey?-1:1));else applyFind();}
+    else if(ev.key==='Escape'){fIn.value='';applyFind();}
+  });
+  fNext.addEventListener('click',()=>goFind(fCur+1));
+  fPrev.addEventListener('click',()=>goFind(fCur-1));
   bCopy.addEventListener('click',()=>copyText(copyTxt));
   bWrap.addEventListener('click',()=>{UI.wrap=!UI.wrap;saveUI();INSPS.forEach(i=>i.syncWrap());});
   bMode.addEventListener('click',()=>{mode=mode==='raw'?'decoded':'raw';bMode.textContent=mode==='raw'?'Show decoded':'Show raw';render(curE);});
-  bDl.addEventListener('click',()=>{if(curE)downloadBody(curE,kind,mode);});
   function syncWrap(){body.classList.toggle('wrap',!!UI.wrap);bWrap.classList.toggle('on',!!UI.wrap);}
   function render(e){
     curE=e;
     tabsEl.textContent='';
     body.textContent='';
+    fMarks=[];fCur=-1;fCnt.textContent='';
     copyTxt='';
     const vis=tabs.filter(t=>!t.cond||(e&&t.cond(e)));
     if(!vis.some(t=>t.id===cur))cur='headers';
@@ -1890,6 +1908,7 @@ function makeInspector(kind,host){
       body.scrollTop=Math.max(0,mr.top-br.top+body.scrollTop-body.clientHeight/3);
       body.scrollLeft=Math.max(0,mr.left-br.left+body.scrollLeft-body.clientWidth/3);
     }
+    applyFind();
   }
   const api={render,syncWrap,focus:()=>body.focus()};
   INSPS.push(api);
@@ -1898,8 +1917,8 @@ function makeInspector(kind,host){
 
 
 /* ---------- left panels ---------- */
-let reqInsp,respInsp,leftTab='sessions',panelsDirty=true;
-const LTABS=[['sessions','Sessions'],['summary','Summary'],['timeline','Timeline'],['insights','Insights'],['correlation','Correlation'],['info','Capture info']];
+let reqInsp,respInsp,leftTab='sessions';
+const LTABS=[['sessions','Sessions'],['summary','Summary'],['timeline','Timeline'],['insights','Insights'],['info','Capture info']];
 const lpanel=$('#lpanel');
 function buildLeftTabs(){
   const h=$('#ltabs');
@@ -1935,7 +1954,7 @@ function entryTable(list,valFn,valHead){
   const t=el('table',{class:'t'});
   t.appendChild(el('tr',null,el('th',null,'#'),el('th',null,valHead),el('th',null,'Status'),el('th',null,'URL')));
   list.forEach(e=>{
-    const r=el('tr',{class:'clk'},el('td',null,String(e.id)),el('td',{style:'white-space:nowrap'},valFn(e)),el('td',null,String(e._status)),el('td',{class:'v',style:'font-family:inherit'},redactText(e.url).slice(0,160)));
+    const r=el('tr',{class:'clk'},el('td',null,String(e.id)),el('td',{style:'white-space:nowrap'},valFn(e)),el('td',null,String(e._status)),el('td',{class:'v',style:'font-family:inherit'},e.url.slice(0,160)));
     r.addEventListener('click',selectRow(e));
     t.appendChild(r);
   });
@@ -1943,12 +1962,10 @@ function entryTable(list,valFn,valHead){
 }
 function renderPanel(name){
   lpanel.textContent='';
-  panelsDirty=false;
   try{
     if(name==='summary')panelSummary();
     else if(name==='timeline')panelTimeline();
     else if(name==='insights')panelInsights();
-    else if(name==='correlation')panelCorrelation();
     else if(name==='info')panelInfo();
   }catch(err){lpanel.appendChild(note('Panel failed: '+err.message));}
 }
@@ -2010,7 +2027,7 @@ function panelInsights(){
     const t=el('table',{class:'t'});
     t.appendChild(el('tr',null,el('th',null,''),el('th',null,'#'),el('th',null,'Message'),el('th',null,'URL')));
     f.slice(0,3000).forEach(r=>{
-      const tr=el('tr',{class:'clk'},el('td',null,el('span',{class:'ins-'+r.sev},INS_ICON[r.sev]||'')),el('td',null,String(r.e.id)),el('td',null,r.msg),el('td',{style:'word-break:break-all'},redactText(r.e.url).slice(0,140)));
+      const tr=el('tr',{class:'clk'},el('td',null,el('span',{class:'ins-'+r.sev},INS_ICON[r.sev]||'')),el('td',null,String(r.e.id)),el('td',null,r.msg),el('td',{style:'word-break:break-all'},r.e.url.slice(0,140)));
       tr.addEventListener('click',selectRow(r.e));
       t.appendChild(tr);
     });
@@ -2026,30 +2043,8 @@ function corrText(e){
   const d=hget(e.respHeaders,'date');
   if(d&&!(e.correlation&&e.correlation.date))lines.push('Date: '+d);
   if(!lines.length)return '';
-  return 'Request: '+e.method+' '+redactText(e.url)+'\nTime: '+(fmtTs(e._t,'UTC'))+' UTC\nStatus: '+e._status+'\n'+lines.join('\n');
+  return 'Request: '+e.method+' '+e.url+'\nTime: '+(fmtTs(e._t,'UTC'))+' UTC\nStatus: '+e._status+'\n'+lines.join('\n');
 }
-function panelCorrelation(){
-  lpanel.appendChild(el('h3',null,'Correlation IDs'));
-  if(selI>=0){
-    const e=E[selI],t=corrText(e);
-    lpanel.appendChild(el('div',{style:'margin-bottom:6px'},el('b',null,'Selected #'+e.id+': '),t?el('button',{onclick:()=>copyText(t)},'Copy for support case'):'no correlation IDs'));
-  }
-  const rows=[];
-  viewEntries().forEach(e=>{if(e.correlation)for(const k in e.correlation){const v=str(e.correlation[k]);if(v)rows.push([e,k,v]);}});
-  lpanel.appendChild(el('div',{style:'margin-bottom:6px'},el('button',{onclick:()=>copyText(rows.map(r=>'#'+r[0].id+' '+r[1]+': '+r[2]).join('\n'))},'Copy all visible ('+rows.length+')')));
-  if(!rows.length){lpanel.appendChild(empty('No correlation IDs in the visible sessions.'));return;}
-  const t=el('table',{class:'t'});
-  t.appendChild(el('tr',null,el('th',null,'#'),el('th',null,'Header'),el('th',null,'Value'),el('th',null,'URL'),el('th',null,'')));
-  rows.slice(0,3000).forEach(r=>{
-    const cb=el('button',{class:'copybtn',onclick:ev=>{ev.stopPropagation();copyText(r[2]);}},'Copy');
-    const tr=el('tr',{class:'clk'},el('td',null,String(r[0].id)),el('td',null,r[1]),el('td',{class:'v'},r[2]),el('td',{style:'word-break:break-all'},redactText(pathQ(r[0])).slice(0,100)),el('td',null,cb));
-    tr.addEventListener('click',selectRow(r[0]));
-    t.appendChild(tr);
-  });
-  lpanel.appendChild(t);
-  if(rows.length>3000)lpanel.appendChild(note('Showing the first 3000 rows.'));
-}
-
 /* ---------- timeline ---------- */
 let TL=null;
 function panelTimeline(){
@@ -2063,7 +2058,7 @@ function panelTimeline(){
   wrap.addEventListener('scroll',()=>{if(!TL.raf)TL.raf=requestAnimationFrame(()=>{TL.raf=0;drawTimeline();});});
   const rowAt=ev=>{const r=cv.getBoundingClientRect();const i=Math.floor((ev.clientY-r.top-22+wrap.scrollTop)/18);return i>=0&&i<TL.list.length?TL.list[i]:null;};
   cv.addEventListener('click',ev=>{const e=rowAt(ev);if(e)select(e._i,{now:true,scroll:true});});
-  cv.addEventListener('mousemove',ev=>{const e=rowAt(ev);info.textContent=e?'#'+e.id+'  '+e.method+'  '+(e._status||0)+'  '+fmtMs(e._dur)+'  '+redactText(e.url).slice(0,200):'Click a bar to select the session.';});
+  cv.addEventListener('mousemove',ev=>{const e=rowAt(ev);info.textContent=e?'#'+e.id+'  '+e.method+'  '+(e._status||0)+'  '+fmtMs(e._dur)+'  '+e.url.slice(0,200):'Click a bar to select the session.';});
   drawTimeline();
 }
 function drawTimeline(){
@@ -2182,7 +2177,7 @@ function diffTable(ops,labels){
   return t;
 }
 function hdrOps(la,lb){
-  const m=l=>{const r=new Map();l.forEach(h=>{const k=str(h.name).toLowerCase();const v=redactHeader(str(h.name),str(h.value));r.set(k,{n:str(h.name),v:r.has(k)?r.get(k).v+', '+v:v});});return r;};
+  const m=l=>{const r=new Map();l.forEach(h=>{const k=str(h.name).toLowerCase();const v=str(h.value);r.set(k,{n:str(h.name),v:r.has(k)?r.get(k).v+', '+v:v});});return r;};
   const A=m(la),B=m(lb);
   const keys=Array.from(new Set([...A.keys(),...B.keys()])).sort();
   return keys.map(k=>{
@@ -2194,7 +2189,6 @@ function hdrOps(la,lb){
 function bodyLines(e,kind){
   let t=bodyText(e,kind,'decoded');
   if(!t)return [bodyView(e,kind,'decoded').msg];
-  t=redactText(t);
   try{t=JSON.stringify(JSON.parse(t),null,2);}catch(err){if(looksXml(t)&&t.length<CAP)t=formatXml(t);}
   const l=t.split(/\r?\n/);
   return l.length>5000?l.slice(0,5000).concat(['\u2026 truncated for comparison \u2026']):l;
@@ -2203,11 +2197,11 @@ function openCompare(ai,bi){
   const A=E[ai],B=E[bi];
   const root=el('div');
   const L=['#'+A.id+'  '+A.method+' '+(A._status||0),'#'+B.id+'  '+B.method+' '+(B._status||0)];
-  const gen=(e)=>['Method: '+e.method,'URL: '+redactText(e.url),'Status: '+e._status+' '+str(e.statusText),'Protocol: '+str(e.httpVersion),'Content-Type: '+e._ct,'Duration: '+fmtMs(e._dur),'Body size: '+fmtBytes(e._size),'Server IP: '+str(e.serverIp)];
+  const gen=(e)=>['Method: '+e.method,'URL: '+e.url,'Status: '+e._status+' '+str(e.statusText),'Protocol: '+str(e.httpVersion),'Content-Type: '+e._ct,'Duration: '+fmtMs(e._dur),'Body size: '+fmtBytes(e._size),'Server IP: '+str(e.serverIp)];
   root.appendChild(sec('General'));
   const ga=gen(A),gb=gen(B);
   root.appendChild(diffTable(ga.map((x,i)=>[x===gb[i]?'eq':'chg',x,gb[i]]),L));
-  const qp=e=>(Array.isArray(e.queryParams)?e.queryParams:[]).map(p=>str(p.name)+'='+redactVal(str(p.name),str(p.value))).sort();
+  const qp=e=>(Array.isArray(e.queryParams)?e.queryParams:[]).map(p=>str(p.name)+'='+str(p.value)).sort();
   root.appendChild(sec('Query parameters'));
   root.appendChild(diffTable(diffLines(qp(A),qp(B)),L));
   root.appendChild(sec('Request headers'));
@@ -2228,22 +2222,24 @@ function reqBodyForCopy(e){
   const b=e.reqBody;
   if(!b||isBin(b))return '';
   const t=str(b.decoded)!==''?str(b.decoded):str(b.raw);
-  return redactText(t);
+  return t;
 }
-function asCurl(e){
-  const p=['curl'];
+function asCurl(e,ps){
+  // The quoting must match the shell the command is pasted into: a bash-style quote is not safe in PowerShell.
+  const q=ps?psq:shq;
+  const p=[ps?'curl.exe':'curl'];
   const m=String(e.method).toUpperCase();
-  if(m!=='GET')p.push('-X '+shq(m));
-  p.push(shq(redactText(e.url)));
+  if(m!=='GET')p.push('-X '+q(m));
+  p.push(q(e.url));
   e.reqHeaders.forEach(h=>{
     const n=str(h.name);
     if(n[0]===':'||/^(content-length|host)$/i.test(n))return;
-    p.push('-H '+shq(n+': '+redactHeader(n,str(h.value))));
+    p.push('-H '+q(n+': '+str(h.value)));
   });
   const body=reqBodyForCopy(e);
-  if(body)p.push('--data-raw '+shq(body));
+  if(body)p.push('--data-raw '+q(body));
   if(/gzip|br|deflate/i.test(hget(e.reqHeaders,'accept-encoding')))p.push('--compressed');
-  return p.join(' \\\n  ');
+  return p.join(ps?' `\n  ':' \\\n  ');
 }
 function asPowerShell(e){
   const m=String(e.method).toUpperCase();
@@ -2252,7 +2248,7 @@ function asPowerShell(e){
   e.reqHeaders.forEach(h=>{
     const n=str(h.name),l=n.toLowerCase();
     if(n[0]===':'||/^(content-length|host)$/.test(l))return;
-    const v=redactHeader(n,str(h.value));
+    const v=str(h.value);
     if(l==='content-type'){ct=v;return;}
     if(l==='user-agent'){ua=v;return;}
     hs.set(n,hs.has(n)?hs.get(n)+', '+v:v);
@@ -2264,7 +2260,7 @@ function asPowerShell(e){
     s+='}\n';
   }
   const std=['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS'];
-  const parts=['Invoke-WebRequest','-Uri '+psq(redactText(e.url))];
+  const parts=['Invoke-WebRequest','-Uri '+psq(e.url)];
   parts.push(std.indexOf(m)>=0?'-Method '+m[0]+m.slice(1).toLowerCase():'-CustomMethod '+psq(m));
   if(hs.size)parts.push('-Headers $headers');
   if(ct)parts.push('-ContentType '+psq(ct));
@@ -2281,10 +2277,10 @@ function csvCell(v,textual){
   return /[",\r\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;
 }
 function exportCsv(){
-  const head=['#','Started (UTC)','Method','Status','URL','Host','Protocol','Content-Type','Type','Body size (bytes)','Transfer size (bytes)','Duration (ms)','Server IP','Cache','Correlation ID','Insights'];
+  const head=['#','Started (UTC)','Method','Status','URL','Host','Protocol','Content-Type','Type','Body size (bytes)','Transfer size (bytes)','Duration (ms)','Server IP','Cache','Correlation ID','x-ms-request-id','Insights'];
   const lines=[head.join(',')];
   viewEntries().forEach(e=>{
-    lines.push([e.id,fmtTs(e._t,'UTC'),e.method,e._status,redactText(e.url),e.host,e.httpVersion,e._ct,e.resourceType,e._size,e._xfer>=0?e._xfer:'',Math.round(e._dur),e.serverIp,e._cache,e._corr1,(Array.isArray(e.insights)?e.insights:[]).map(x=>str(x.severity)+': '+str(x.message)).join(' | ')].map((v,i)=>csvCell(v,[2,4,5,6,7,8,12,13,14,15].indexOf(i)>=0)).join(','));
+    lines.push([e.id,fmtTs(e._t,'UTC'),e.method,e._status,e.url,e.host,e.httpVersion,e._ct,e.resourceType,e._size,e._xfer>=0?e._xfer:'',Math.round(e._dur),e.serverIp,e._cache,e._corr1,e._xms,(Array.isArray(e.insights)?e.insights:[]).map(x=>str(x.severity)+': '+str(x.message)).join(' | ')].map((v,i)=>csvCell(v,[2,4,5,6,7,8,12,13,14,15,16].indexOf(i)>=0)).join(','));
   });
   saveBlob('sessions.csv','text/csv;charset=utf-8','\uFEFF'+lines.join('\r\n'));
 }
@@ -2293,19 +2289,19 @@ function exportSession(){
   const e=E[selI];
   saveBlob('session_'+e.id+'.txt','text/plain;charset=utf-8',rawRequestText(e,'decoded')+'\r\n\r\n'+'-'.repeat(60)+'\r\n\r\n'+rawResponseText(e,'decoded'));
 }
-function harHeaders(l){return l.map(h=>({name:str(h.name),value:redactHeader(str(h.name),str(h.value))}));}
+function harHeaders(l){return l.map(h=>({name:str(h.name),value:str(h.value)}));}
 function harEntry(e){
   const rq=e.reqBody||{},rs=e.respBody||{};
   const t=e.timings||{};
   const tv=k=>{const v=Number(t[k]);return isFinite(v)?v:-1;};
-  const req={method:e.method,url:redactText(e.url),httpVersion:str(e.httpVersion)||'HTTP/1.1',cookies:(Array.isArray(e.reqCookies)?e.reqCookies:[]).map(c=>({name:str(c.name),value:UI.redact?mask(c.value):str(c.value)})),headers:harHeaders(e.reqHeaders),queryString:(Array.isArray(e.queryParams)?e.queryParams:[]).map(p=>({name:str(p.name),value:redactVal(str(p.name),str(p.value))})),headersSize:-1,bodySize:num(rq.size)};
+  const req={method:e.method,url:e.url,httpVersion:str(e.httpVersion)||'HTTP/1.1',cookies:(Array.isArray(e.reqCookies)?e.reqCookies:[]).map(c=>({name:str(c.name),value:str(c.value)})),headers:harHeaders(e.reqHeaders),queryString:(Array.isArray(e.queryParams)?e.queryParams:[]).map(p=>({name:str(p.name),value:str(p.value)})),headersSize:-1,bodySize:num(rq.size)};
   const rt=reqBodyForCopy(e);
   if(rt)req.postData={mimeType:hget(e.reqHeaders,'content-type'),text:rt};
   const content={size:num(rs.size),mimeType:e._ct};
   if(rs.b64&&isBin(rs)){content.text=rs.b64;content.encoding='base64';}
-  else{const tx=str(rs.decoded)!==''?str(rs.decoded):str(rs.raw);if(tx)content.text=redactText(tx);}
+  else{const tx=str(rs.decoded)!==''?str(rs.decoded):str(rs.raw);if(tx)content.text=tx;}
   return {pageref:e.pageRef!=null?e.pageRef:undefined,startedDateTime:str(e.startedDateTime)||new Date(e._t).toISOString(),time:e._dur,request:req,
-    response:{status:e._status,statusText:str(e.statusText),httpVersion:str(e.httpVersion)||'HTTP/1.1',cookies:(Array.isArray(e.respCookies)?e.respCookies:[]).map(c=>({name:str(c.name),value:UI.redact?mask(c.value):str(c.value),path:c.path,domain:c.domain,expires:c.expires,httpOnly:!!c.httpOnly,secure:!!c.secure})),headers:harHeaders(e.respHeaders),content:content,redirectURL:str(e.redirectURL),headersSize:-1,bodySize:e._xfer>=0?e._xfer:-1},
+    response:{status:e._status,statusText:str(e.statusText),httpVersion:str(e.httpVersion)||'HTTP/1.1',cookies:(Array.isArray(e.respCookies)?e.respCookies:[]).map(c=>({name:str(c.name),value:str(c.value),path:c.path,domain:c.domain,expires:c.expires,httpOnly:!!c.httpOnly,secure:!!c.secure})),headers:harHeaders(e.respHeaders),content:content,redirectURL:str(e.redirectURL),headersSize:-1,bodySize:e._xfer>=0?e._xfer:-1},
     cache:{},timings:{blocked:tv('blocked'),dns:tv('dns'),connect:tv('connect'),ssl:tv('ssl'),send:Math.max(0,tv('send')),wait:Math.max(0,tv('wait')),receive:Math.max(0,tv('receive'))},
     serverIPAddress:str(e.serverIp),connection:str(e.connection),_resourceType:e.resourceType};
 }
@@ -2313,7 +2309,7 @@ function exportHar(){
   const ents=viewEntries();
   const used=new Set(ents.map(e=>e.pageRef));
   const har={log:{version:'1.2',creator:{name:'HAR2HTML report export',version:'1.0'},pages:pagesMeta.filter(p=>used.has(p.id)).map(p=>({startedDateTime:str(p.startedDateTime),id:str(p.id),title:str(p.title),pageTimings:{}})),entries:ents.map(harEntry)}};
-  const base=str(meta.sourceFile).replace(/\.(har|saz)$/i,'').replace(/[^\w.\-]/g,'_')||'report';
+  const base=str(meta.sourceFile).replace(/\.har$/i,'').replace(/[^\w.\-]/g,'_')||'report';
   saveBlob(base+'_filtered.har','application/json',JSON.stringify(har,null,2));
 }
 
@@ -2331,7 +2327,7 @@ function openHelp(){
   root.appendChild(el('h3',null,'Legend'));
   const lg=[['4xx / 5xx','red text'],['3xx','purple text'],['304','grey text'],['Status 0 / failed','red italic'],['CSS','purple'],['JS','green'],['Images','grey'],['Yellow row','search match'],['Blue row','selected session'],['\u2716 \u26A0 \u2139','insight: error / warning / info'],[TYPE_ICON.document+' '+TYPE_ICON.xhr+' '+TYPE_ICON.script,'document / XHR-fetch / script']];
   root.appendChild(kvTable(lg,null));
-  root.appendChild(el('p',null,'Search covers URL, headers, bodies (raw and decoded) and decoded JWT/SAML content. Redact masks tokens, cookies and passwords on screen only. All data stays in this file; nothing is sent over the network.'));
+  root.appendChild(el('p',null,'Search covers URL, headers, bodies (raw and decoded) and decoded JWT/SAML content. All data stays in this file; nothing is sent over the network.'));
   openModal('Help',root,false);
 }
 
@@ -2345,7 +2341,6 @@ function applyTheme(){
 }
 function syncToggles(){
   $('#bColors').classList.toggle('on',!!UI.colors);
-  $('#bRedact').classList.toggle('on',!!UI.redact);
   $('#bPages').classList.toggle('on',!!UI.pages);
   $('#bTime').textContent=UI.tz;
   $('#bCase').classList.toggle('on',S.cs);
@@ -2402,7 +2397,6 @@ function init(){
   $('#bPrev').addEventListener('click',()=>gotoMatch(-1));
   $('#bTime').addEventListener('click',()=>{UI.tz=UI.tz==='Local'?'UTC':UI.tz==='UTC'?'Relative':'Local';saveUI();syncToggles();refreshAll();});
   $('#bColors').addEventListener('click',()=>{UI.colors=!UI.colors;saveUI();syncToggles();renderGrid(true);});
-  $('#bRedact').addEventListener('click',()=>{UI.redact=!UI.redact;saveUI();syncToggles();refreshAll();});
   $('#bPages').addEventListener('click',()=>{UI.pages=!UI.pages;saveUI();syncToggles();applyView();});
   $('#bDark').addEventListener('click',()=>{UI.theme=UI.theme==='dark'?'light':'dark';saveUI();applyTheme();});
   $('#bHelp').addEventListener('click',openHelp);
@@ -2726,6 +2720,59 @@ public static class HarFmt
     try { Add-Type -TypeDefinition $csharp -Language CSharp } catch { Write-Warning ('Native helper failed to compile: ' + $_.Exception.Message) }
 }
 
+# Separate type so a stale HarFmt already loaded in the session cannot hide it.
+if (-not ('HarSalvage' -as [type])) {
+    $salvageCs = @'
+public static class HarSalvage
+{
+    // Recovers a truncated HAR by cutting after the last complete log.entries item and closing the document.
+    public static string TruncatedHar(string t, out int kept)
+    {
+        kept = 0;
+        char[] stack = new char[256];
+        int depth = 0, cut = -1, strStart = 0;
+        bool inStr = false, esc = false, entriesKey = false;
+        string lastStr = null;
+        for (int i = 0; i < t.Length; i++)
+        {
+            char c = t[i];
+            if (inStr)
+            {
+                if (esc) { esc = false; }
+                else if (c == '\\') { esc = true; }
+                else if (c == '"')
+                {
+                    inStr = false;
+                    if (depth == 2) { lastStr = t.Substring(strStart, i - strStart); }
+                }
+                continue;
+            }
+            if (c == '"') { inStr = true; strStart = i + 1; continue; }
+            if (c == '{' || c == '[')
+            {
+                if (depth >= stack.Length) { return null; }
+                stack[depth++] = c;
+            }
+            else if (c == '}' || c == ']')
+            {
+                if (depth == 0) { return null; }
+                depth--;
+                if (depth == 3 && c == '}' && entriesKey && stack[0] == '{' && stack[1] == '{' && stack[2] == '[')
+                {
+                    cut = i + 1;
+                    kept++;
+                }
+            }
+            else if (c == ':' && depth == 2) { entriesKey = (lastStr == "entries"); }
+        }
+        if (cut < 0) { return null; }
+        return t.Substring(0, cut) + "]}}";
+    }
+}
+'@
+    try { Add-Type -TypeDefinition $salvageCs -Language CSharp } catch { Write-Warning ('Native salvage helper failed to compile: ' + $_.Exception.Message) }
+}
+
 $script:Jss = $null
 try {
     if ($PSVersionTable.PSVersion.Major -ge 6) { throw 'JavaScriptSerializer is only used on Windows PowerShell' }
@@ -2743,17 +2790,22 @@ $script:HasBrotli = [bool]('System.IO.Compression.BrotliStream' -as [type])
 function Initialize-Constants {
 $script:RxJwtKey = New-Object System.Text.RegularExpressions.Regex '(?:"(?<k>[^"\r\n]{1,40})"\s*:\s*")?(?<t>eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*)'
 $script:RxJwt = New-Object System.Text.RegularExpressions.Regex 'eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*'
-$script:SecretNameList = 'client_secret|password|passwd|code|access_token|refresh_token|id_token|SAMLResponse|assertion|client_assertion|code_verifier'
+$script:SecretNameList = 'client_secret|clientSecret|password|passwd|pwd|code|access_token|accessToken|refresh_token|refreshToken|id_token|idToken|token|secret|api_key|api-key|apikey|auth_token|authToken|session_token|sessionToken|sig|signature|private_key|privateKey|SAMLResponse|SAMLRequest|assertion|client_assertion|code_verifier'
 $script:RxJsonSecret = New-Object System.Text.RegularExpressions.Regex ('(?i)(?<p>"(?<n>' + $script:SecretNameList + ')"\s*:\s*")(?<v>(?:[^"\\]|\\.)*)(?<q>")')
-$script:RxInputTag = New-Object System.Text.RegularExpressions.Regex '(?is)<input\b[^>]*>'
+$script:RxInputTag = New-Object System.Text.RegularExpressions.Regex ('(?is)<input\b[^>]{0,2000}>'), ([System.Text.RegularExpressions.RegexOptions]::None), ([TimeSpan]::FromSeconds(5))
 $script:RxInputSecretName = New-Object System.Text.RegularExpressions.Regex ('(?is)\bname\s*=\s*["'']?(?:' + $script:SecretNameList + ')["'']?(?:[\s>/])')
 $script:RxInputValue = New-Object System.Text.RegularExpressions.Regex '(?is)(?<p>\bvalue\s*=\s*["''])(?<v>[^"'']*)(?<q>["''])'
-$script:RxUrlSecret = New-Object System.Text.RegularExpressions.Regex ('(?i)(?<p>[?&#;](?:' + $script:SecretNameList + ')=)(?<v>[^&#]*)')
+$script:RxUrlSecret = New-Object System.Text.RegularExpressions.Regex ('(?i)(?<p>[?&#;](?<n>' + $script:SecretNameList + ')=)(?<v>[^&#]*)')
+# name=value pairs and XML elements inside free-text bodies (HTML, JS, text/plain, SOAP)
+$script:RxTextAssign = New-Object System.Text.RegularExpressions.Regex ('(?i)(?<p>(?<![\w.-])(?<n>' + $script:SecretNameList + ')\s*=\s*["'']?)(?<v>[^&#\s"''<>)]{4,})')
+$script:RxXmlSecret = New-Object System.Text.RegularExpressions.Regex '(?is)(?<p><(?:[\w-]+:)?(?<n>Password|Pwd|Secret|ClientSecret|BinarySecurityToken|AccessToken|RefreshToken|IdToken|ApiKey|SessionToken)\b[^>]{0,500}>)(?<v>[^<]+)(?<q></)'
 
 $script:SecretParamNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($n in ($script:SecretNameList -split '\|')) { [void]$script:SecretParamNames.Add($n) }
 $script:SecretHeaderNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-foreach ($n in 'authorization', 'proxy-authorization', 'cookie', 'set-cookie', 'x-api-key', 'ocp-apim-subscription-key') { [void]$script:SecretHeaderNames.Add($n) }
+foreach ($n in 'authorization', 'proxy-authorization', 'cookie', 'set-cookie', 'x-api-key', 'ocp-apim-subscription-key', 'x-auth-token', 'x-csrf-token', 'x-xsrf-token',
+    'x-access-token', 'api-key', 'apikey', 'x-functions-key', 'x-goog-api-key', 'x-amz-security-token', 'x-api-token', 'x-ms-token-aad-access-token',
+    'x-ms-token-aad-id-token', 'x-ms-token-aad-refresh-token') { [void]$script:SecretHeaderNames.Add($n) }
 $script:UrlHeaderNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($n in 'location', 'referer', 'content-location') { [void]$script:UrlHeaderNames.Add($n) }
 
@@ -2768,17 +2820,29 @@ $script:JsonSecretEvaluator = [System.Text.RegularExpressions.MatchEvaluator] {
     param($m)
     $v = $m.Groups['v'].Value
     if ($m.Groups['n'].Value -ieq 'code' -and $v.Length -lt 20) { return $m.Value }
-    return $m.Groups['p'].Value + (Get-MaskedValue $v) + $m.Groups['q'].Value
+    return $m.Groups['p'].Value + (Get-MaskedValue $v -Full:(Test-FullMaskName $m.Groups['n'].Value)) + $m.Groups['q'].Value
 }
 $script:InputTagEvaluator = [System.Text.RegularExpressions.MatchEvaluator] {
     param($m)
     $tag = $m.Value
     if (-not $script:RxInputSecretName.IsMatch($tag)) { return $tag }
-    return $script:RxInputValue.Replace($tag, [System.Text.RegularExpressions.MatchEvaluator] { param($x) $x.Groups['p'].Value + (Get-MaskedValue $x.Groups['v'].Value) + $x.Groups['q'].Value })
+    $nm = [regex]::Match($tag, '(?i)\bname\s*=\s*["'']?([\w-]+)').Groups[1].Value
+    $full = Test-FullMaskName $nm
+    return $script:RxInputValue.Replace($tag, [System.Text.RegularExpressions.MatchEvaluator] { param($x) $x.Groups['p'].Value + (Get-MaskedValue $x.Groups['v'].Value -Full:$full) + $x.Groups['q'].Value })
 }
 $script:UrlSecretEvaluator = [System.Text.RegularExpressions.MatchEvaluator] {
     param($m)
-    return $m.Groups['p'].Value + (Get-MaskedValue $m.Groups['v'].Value)
+    return $m.Groups['p'].Value + (Get-MaskedValue $m.Groups['v'].Value -Full:(Test-FullMaskName $m.Groups['n'].Value))
+}
+$script:TextAssignEvaluator = [System.Text.RegularExpressions.MatchEvaluator] {
+    param($m)
+    $v = $m.Groups['v'].Value
+    if ($m.Groups['n'].Value -ieq 'code' -and $v.Length -lt 20) { return $m.Value }
+    return $m.Groups['p'].Value + (Get-MaskedValue $v -Full:(Test-FullMaskName $m.Groups['n'].Value))
+}
+$script:XmlSecretEvaluator = [System.Text.RegularExpressions.MatchEvaluator] {
+    param($m)
+    return $m.Groups['p'].Value + (Get-MaskedValue $m.Groups['v'].Value.Trim() -Full:(Test-FullMaskName $m.Groups['n'].Value)) + $m.Groups['q'].Value
 }
 }
 #endregion
@@ -2828,6 +2892,8 @@ function Get-Num {
 #region Add-Insight
 function Add-Insight {
     param($List, [string]$Severity, [string]$Message)
+    # Insight texts quote raw URLs, headers and bodies, so they must be masked as well when redacting.
+    if ($script:Redact) { $Message = Protect-Secrets -Mode Text -Value (Protect-Secrets -Mode Url -Value $Message) }
     foreach ($i in $List) { if ($i['message'] -eq $Message) { return } }
     $List.Add([ordered]@{ severity = $Severity; message = $Message })
 }
@@ -2933,10 +2999,18 @@ function Write-Stage {
 
 #region Get-MaskedValue
 function Get-MaskedValue {
-    param([string]$Value)
+    # Short and medium values are masked completely; longer values keep a few characters per end (max 4), so at most
+    # about a quarter of the value is disclosed. -Full always hides the whole value (passwords, secrets).
+    param([string]$Value, [switch]$Full)
     if ([string]::IsNullOrEmpty($Value)) { return $Value }
-    if ($Value.Length -le 8) { return '****' }
-    return $Value.Substring(0, 4) + '****' + $Value.Substring($Value.Length - 4)
+    if ($Full -or $Value.Length -le 12) { return '****' }
+    $k = [Math]::Min(4, [int][Math]::Floor($Value.Length / 8))
+    return $Value.Substring(0, $k) + '****' + $Value.Substring($Value.Length - $k)
+}
+
+function Test-FullMaskName {
+    param([string]$Name)
+    return [bool]($Name -match '(?i)^(client[_-]?secret|password|passwd|pwd|secret|code_verifier|api[_-]?key|apikey)$')
 }
 #endregion
 
@@ -2951,7 +3025,7 @@ function Protect-Secrets {
     if ([string]::IsNullOrEmpty($Value)) { return $Value }
     switch ($Mode) {
         'Param' {
-            if ($script:SecretParamNames.Contains($Name)) { return Get-MaskedValue $Value }
+            if ($script:SecretParamNames.Contains($Name)) { return Get-MaskedValue $Value -Full:(Test-FullMaskName $Name) }
             return $script:RxJwt.Replace($Value, $script:MaskEvaluator)
         }
         'Header' {
@@ -2980,7 +3054,7 @@ function Protect-Secrets {
                 if ($Value -match '^\s*(Bearer|Basic|Negotiate|NTLM|Digest|Kerberos)\s+(.+)$') { return $Matches[1] + ' ' + (Get-MaskedValue $Matches[2].Trim()) }
                 return Get-MaskedValue $Value
             }
-            if ($script:SecretHeaderNames.Contains($n)) { return Get-MaskedValue $Value }
+            if ($script:SecretHeaderNames.Contains($n)) { return Get-MaskedValue $Value -Full:(Test-FullMaskName ($n -replace '^x-', '')) }
             if ($script:UrlHeaderNames.Contains($n)) { return Protect-Secrets -Mode Url -Value $Value }
             return $script:RxJwt.Replace($Value, $script:MaskEvaluator)
         }
@@ -2997,13 +3071,15 @@ function Protect-Secrets {
                 $eq = $p.IndexOf('=')
                 if ($eq -lt 0) { [void]$sb.Append($p); continue }
                 $nm = ConvertFrom-UrlEncoded $p.Substring(0, $eq)
-                if ($script:SecretParamNames.Contains($nm)) { [void]$sb.Append($p.Substring(0, $eq + 1)).Append((Get-MaskedValue $p.Substring($eq + 1))) } else { [void]$sb.Append($p) }
+                if ($script:SecretParamNames.Contains($nm)) { [void]$sb.Append($p.Substring(0, $eq + 1)).Append((Get-MaskedValue $p.Substring($eq + 1) -Full:(Test-FullMaskName $nm))) } else { [void]$sb.Append($p) }
             }
             return $script:RxJwt.Replace($sb.ToString(), $script:MaskEvaluator)
         }
         'Text' {
             $r = $script:RxJsonSecret.Replace($Value, $script:JsonSecretEvaluator)
             if ($r.IndexOf('<input', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $r = $script:RxInputTag.Replace($r, $script:InputTagEvaluator) }
+            if ($r.IndexOf('=', [System.StringComparison]::Ordinal) -ge 0) { $r = $script:RxTextAssign.Replace($r, $script:TextAssignEvaluator) }
+            if ($r.IndexOf('<', [System.StringComparison]::Ordinal) -ge 0) { $r = $script:RxXmlSecret.Replace($r, $script:XmlSecretEvaluator) }
             return $script:RxJwt.Replace($r, $script:MaskEvaluator)
         }
     }
@@ -3245,7 +3321,7 @@ function Read-Multipart {
         if (-not $fname) {
             $ptext = $body
             if ($ptext.Length -gt $script:MaxBodyBytes) { $ptext = $ptext.Substring(0, [int]$script:MaxBodyBytes) }
-            if ($Redact -and $script:SecretParamNames.Contains($pname)) { $ptext = Get-MaskedValue $ptext }
+            if ($Redact -and $script:SecretParamNames.Contains($pname)) { $ptext = Get-MaskedValue $ptext -Full:(Test-FullMaskName $pname) }
             elseif ($Redact) { $ptext = Protect-Secrets -Mode Text -Value $ptext }
         }
         $outHdrs = if ($Redact) { Protect-PairList $hdrs 'Header' } else { $hdrs }
@@ -3354,8 +3430,8 @@ function Expand-Body {
     $model.originalSize = $model.size
     $out.Text = $str
 
-    # Images stored as text (e.g. SVG) still get a b64 copy for previews.
-    if ($null -ne $bytes -and $mime -like 'image/*' -and $bytes.Length -le $cap) { $model.b64 = [System.Convert]::ToBase64String($bytes) }
+    # Images stored as text (e.g. SVG) still get a b64 copy for previews (not when redacting: it would hold the unmasked bytes).
+    if ($null -ne $bytes -and -not $Redact -and $mime -like 'image/*' -and $bytes.Length -le $cap) { $model.b64 = [System.Convert]::ToBase64String($bytes) }
 
     $truncated = $false
     $work = $str
@@ -3585,15 +3661,27 @@ function Get-HtmlSamlInputs {
 
 #region Get-CorrelationIds
 function Get-CorrelationIds {
-    param($ReqHeaders, $RespHeaders)
-    $names = 'x-ms-request-id', 'x-ms-correlation-id', 'client-request-id', 'request-id', 'x-ms-ags-diagnostic', 'traceparent',
-        'x-correlation-id', 'date', 'x-request-id', 'x-ms-client-request-id', 'ms-cv', 'sprequestguid'
+    param($ReqHeaders, $RespHeaders, [string]$BodyText = '', [string]$ReqBodyText = '')
+    $names = 'x-ms-request-id', 'x-ms-correlation-id', 'x-ms-correlation-request-id', 'client-request-id', 'request-id', 'x-ms-ags-diagnostic', 'traceparent',
+        'x-correlation-id', 'correlationid', 'date', 'x-request-id', 'x-ms-client-request-id', 'ms-cv', 'sprequestguid'
     $c = [ordered]@{}
     foreach ($n in $names) {
         $v = Get-HeaderValue $RespHeaders $n
         if ([string]::IsNullOrEmpty($v)) { $v = Get-HeaderValue $ReqHeaders $n }
         if (-not [string]::IsNullOrEmpty($v)) { $c[$n] = $v }
     }
+    # correlationId = <guid> inside the response or request body (JSON, XML, plain text or escaped JSON)
+    $found = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($text in $BodyText, $ReqBodyText) {
+        if ([string]::IsNullOrEmpty($text)) { continue }
+        if ($text.Length -gt 2000000) { $text = $text.Substring(0, 2000000) }
+        foreach ($m in [regex]::Matches($text, '(?i)correlation[_-]?id[\s"''\\:=>]{1,10}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')) {
+            $g = $m.Groups[1].Value
+            if (-not $found.Contains($g)) { $found.Add($g) }
+            if ($found.Count -ge 5) { break }
+        }
+    }
+    if ($found.Count -gt 0) { $c['correlationId'] = ($found -join ', ') }
     return $c
 }
 #endregion
@@ -3897,7 +3985,7 @@ function ConvertTo-NormalizedEntry {
             if (-not $reqCt) { $reqCt = 'application/x-www-form-urlencoded' }
         }
     }
-    $reqRes = Expand-Body -Text $postText -IsBase64 ([string](Get-Prop $pd '_encoding' '') -eq 'base64') -ContentType $reqCt -ContentEncoding ([string](Get-HeaderValue $reqHdrRaw 'content-encoding')) `
+    $reqRes = Expand-Body -Text $postText -IsBase64 $false -ContentType $reqCt -ContentEncoding ([string](Get-HeaderValue $reqHdrRaw 'content-encoding')) `
         -DeclaredSize (Get-Num (Get-Prop $req 'bodySize' 0)) -CompressedSize 0 -Insights $ins -Side 'Request' -Redact $redact
     $reqBody = $reqRes.Model
 
@@ -4055,10 +4143,10 @@ function ConvertTo-NormalizedEntry {
     $e['respBody'] = $respBody
     $e['timings'] = $timings
     $e['redirectURL'] = $(if ($redact) { Protect-Secrets -Mode Url -Value $redirect } else { $redirect })
-    $e['correlation'] = Get-CorrelationIds $reqHdrRaw $respHdrRaw
+    $e['correlation'] = Get-CorrelationIds $reqHdrRaw $respHdrRaw ([string]$respRes.Text) ([string]$reqRes.Text)
     $e['auth'] = [ordered]@{ jwt = $jwts; saml = $samls; oauthParams = $oauth }
     $e['wsMessages'] = $ws
-    $e['error'] = $err
+    $e['error'] = $(if ($redact) { Protect-Secrets -Mode Text -Value (Protect-Secrets -Mode Url -Value $err) } else { $err })
 
     # Keep browser-specific fields
     if ($Entry -is [System.Collections.IDictionary]) {
@@ -4093,315 +4181,31 @@ function New-HarError {
 }
 #endregion
 
-#region Read-SazFile
-# Fiddler .saz archives (zip) hold one raw/NN_c.txt (request), NN_s.txt (response), NN_m.xml (metadata) and optionally
-# NN_w.txt (WebSocket) per session. They are converted in memory to HAR-shaped entries so the normal pipeline applies.
-function Find-BodyStart {
-    # Returns @{ HeaderEnd; BodyStart } for the first blank line in the raw message, or the whole buffer as headers.
-    param([byte[]]$Bytes, [int]$From = 0)
-    for ($i = $From; $i -lt $Bytes.Length - 1; $i++) {
-        if ($Bytes[$i] -eq 10) {
-            if ($Bytes[$i + 1] -eq 10) { return @{ HeaderEnd = $i; BodyStart = $i + 2 } }
-            if ($Bytes[$i + 1] -eq 13 -and $i + 2 -lt $Bytes.Length -and $Bytes[$i + 2] -eq 10) { return @{ HeaderEnd = $i; BodyStart = $i + 3 } }
-        }
-    }
-    return @{ HeaderEnd = $Bytes.Length; BodyStart = $Bytes.Length }
-}
-
-function Read-SazMessage {
-    # Splits a raw HTTP message into first line, headers and body bytes (chunked bodies are de-chunked).
-    param([byte[]]$Bytes)
-    $split = Find-BodyStart $Bytes
-    $head = [System.Text.Encoding]::UTF8.GetString($Bytes, 0, $split.HeaderEnd)
-    $lines = $head -split "\r?\n"
-    $headers = New-Object 'System.Collections.Generic.List[object]'
-    for ($i = 1; $i -lt $lines.Count; $i++) {
-        $ln = $lines[$i]
-        $ci = $ln.IndexOf(':')
-        if ($ci -gt 0) { $headers.Add([ordered]@{ name = $ln.Substring(0, $ci).Trim(); value = $ln.Substring($ci + 1).Trim() }) }
-    }
-    $bodyLen = $Bytes.Length - $split.BodyStart
-    $body = New-Object byte[] $bodyLen
-    if ($bodyLen -gt 0) { [System.Array]::Copy($Bytes, $split.BodyStart, $body, 0, $bodyLen) }
-    $te = ''
-    foreach ($h in $headers) { if ($h['name'] -ieq 'transfer-encoding') { $te = [string]$h['value'] } }
-    if ($te -match '(?i)chunked' -and $body.Length -gt 0) { $body = Expand-Chunked $body }
-    return @{ FirstLine = [string]$lines[0]; Headers = $headers.ToArray(); Body = $body }
-}
-
-function Expand-Chunked {
-    param([byte[]]$Data)
-    $ms = New-Object System.IO.MemoryStream
-    $pos = 0
-    while ($pos -lt $Data.Length) {
-        $eol = $pos
-        while ($eol -lt $Data.Length -and $Data[$eol] -ne 10) { $eol++ }
-        if ($eol -ge $Data.Length) { break }
-        $sizeText = [System.Text.Encoding]::ASCII.GetString($Data, $pos, $eol - $pos).Split(';')[0].Trim()
-        $size = 0
-        try { $size = [Convert]::ToInt32($sizeText, 16) } catch { return $Data }
-        $pos = $eol + 1
-        if ($size -eq 0) { break }
-        if ($pos + $size -gt $Data.Length) { $size = $Data.Length - $pos }
-        $ms.Write($Data, $pos, $size)
-        $pos += $size
-        if ($pos -lt $Data.Length -and $Data[$pos] -eq 13) { $pos++ }
-        if ($pos -lt $Data.Length -and $Data[$pos] -eq 10) { $pos++ }
-    }
-    return $ms.ToArray()
-}
-
-function ConvertFrom-SazTime {
-    param([string]$Text)
-    if ([string]::IsNullOrWhiteSpace($Text) -or $Text.StartsWith('0001-')) { return $null }
-    $d = [System.DateTimeOffset]::MinValue
-    if ([System.DateTimeOffset]::TryParse($Text, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { return $d }
-    return $null
-}
-
-function Get-SazBodyPayload {
-    # Text when the body is plain readable text, otherwise base64 (so compression and binary detection run in Expand-Body).
-    param([byte[]]$Bytes, [string]$ContentType, [string]$ContentEncoding)
-    if ($Bytes.Length -eq 0) { return @{ Text = $null; Encoding = '' } }
-    $asB64 = @{ Text = [System.Convert]::ToBase64String($Bytes); Encoding = 'base64' }
-    if ($ContentEncoding -and $ContentEncoding -notmatch '(?i)^\s*identity\s*$') { return $asB64 }
-    if ($ContentType -match '(?i)^\s*(image|audio|video|font)/|octet-stream|zip|pdf|protobuf|bond') { return $asB64 }
-    if ([System.Array]::IndexOf($Bytes, [byte]0) -ge 0) { return $asB64 }
-    try {
-        $start = 0
-        if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) { $start = 3 }
-        $txt = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($Bytes, $start, $Bytes.Length - $start)
-        return @{ Text = $txt; Encoding = '' }
-    } catch { return $asB64 }
-}
-
-function Read-SazWebSocket {
-    param([byte[]]$Bytes, $Fallback)
-    $msgs = New-Object 'System.Collections.Generic.List[object]'
-    $latin = [System.Text.Encoding]::GetEncoding(28591)
-    $pos = 0
-    while ($pos -lt $Bytes.Length) {
-        while ($pos -lt $Bytes.Length -and ($Bytes[$pos] -eq 13 -or $Bytes[$pos] -eq 10)) { $pos++ }
-        if ($pos -ge $Bytes.Length) { break }
-        $split = Find-BodyStart $Bytes $pos
-        $head = $latin.GetString($Bytes, $pos, $split.HeaderEnd - $pos)
-        $m = [regex]::Match($head, '(?im)^(Request|Response)-Length:\s*(\d+)')
-        if (-not $m.Success) { break }
-        $len = [int]$m.Groups[2].Value
-        if ($split.BodyStart + $len -gt $Bytes.Length) { $len = $Bytes.Length - $split.BodyStart }
-        $payload = New-Object byte[] $len
-        if ($len -gt 0) { [System.Array]::Copy($Bytes, $split.BodyStart, $payload, 0, $len) }
-        $pos = $split.BodyStart + $len
-        $when = $null
-        $tm = [regex]::Match($head, '(?im)^DoneRead:\s*(\S+)')
-        if ($tm.Success) { $when = ConvertFrom-SazTime $tm.Groups[1].Value }
-        if ($null -eq $when) { $when = $Fallback }
-        $p = Get-SazBodyPayload $payload '' ''
-        $isText = ($p.Encoding -ne 'base64')
-        $msgs.Add([ordered]@{
-                type = $(if ($m.Groups[1].Value -ieq 'Request') { 'send' } else { 'receive' })
-                time = $(if ($null -ne $when) { ($when.UtcDateTime - $script:Epoch).TotalSeconds } else { 0 })
-                opcode = $(if ($isText) { 1 } else { 2 })
-                data = $(if ($isText) { [string]$p.Text } else { $p.Text })
-            })
-    }
-    return $msgs
-}
-
-function ConvertFrom-SazSession {
-    param([string]$Id, [byte[]]$ReqBytes, [byte[]]$RespBytes, [string]$MetaXml, [byte[]]$WsBytes)
-    $flags = @{}
-    $timers = @{}
-    if ($MetaXml) {
-        try {
-            $rs = New-Object System.Xml.XmlReaderSettings
-            $rs.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
-            $rs.XmlResolver = $null
-            $reader = [System.Xml.XmlReader]::Create((New-Object System.IO.StringReader($MetaXml)), $rs)
-            $doc = New-Object System.Xml.XmlDocument
-            $doc.XmlResolver = $null
-            try { $doc.Load($reader) } finally { $reader.Close() }
-            foreach ($n in $doc.SelectNodes('/Session/SessionFlags/SessionFlag')) { $flags[$n.GetAttribute('N').ToLowerInvariant()] = $n.GetAttribute('V') }
-            $tn = $doc.SelectSingleNode('/Session/SessionTimers')
-            if ($null -ne $tn) { foreach ($a in $tn.Attributes) { $timers[$a.Name] = $a.Value } }
-        } catch { Write-Warning ("Session {0}: metadata (_m.xml) could not be parsed: {1}" -f $Id, $_.Exception.Message) }
-    }
-    $T = { param($k) if ($timers.ContainsKey($k)) { return (ConvertFrom-SazTime $timers[$k]) } return $null }
-    $Num = { param($k) $d = 0.0; if ($timers.ContainsKey($k) -and [double]::TryParse($timers[$k], [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return $d } return 0.0 }
-    $Diff = { param($a, $b) if ($null -ne $a -and $null -ne $b) { $v = ($b - $a).TotalMilliseconds; if ($v -gt 0) { return $v } } return 0.0 }
-
-    $req = Read-SazMessage $ReqBytes
-    $rp = $req.FirstLine.Trim() -split '\s+', 3
-    if ($rp.Count -lt 2) { throw 'request line is malformed' }
-    $method = $rp[0].ToUpperInvariant()
-    $target = $rp[1]
-    $reqVer = ''
-    if ($rp.Count -ge 3) { $reqVer = $rp[2] }
-    $hostHdr = ''
-    foreach ($h in $req.Headers) { if ($h['name'] -ieq 'host') { $hostHdr = [string]$h['value'] } }
-    if ($method -eq 'CONNECT') {
-        $url = 'https://' + $target + '/'
-    } elseif ($target -match '^(?i)[a-z][a-z0-9+.\-]*://') {
-        $url = $target
-    } else {
-        $sch = 'http'
-        if ($flags.ContainsKey('https-client-version') -or $hostHdr -match ':443$') { $sch = 'https' }
-        if ($target.StartsWith('/')) { $url = $sch + '://' + $hostHdr + $target } else { $url = $sch + '://' + $hostHdr + '/' + $target }
-    }
-
-    $reqCt = ''
-    $reqCe = ''
-    foreach ($h in $req.Headers) {
-        if ($h['name'] -ieq 'content-type') { $reqCt = [string]$h['value'] }
-        if ($h['name'] -ieq 'content-encoding') { $reqCe = [string]$h['value'] }
-    }
-    $reqBody = $req.Body
-    if ($method -eq 'CONNECT') { $reqBody = [byte[]]@() }
-    $reqPayload = Get-SazBodyPayload $reqBody $reqCt $reqCe
-    $postData = $null
-    if ($reqBody.Length -gt 0) {
-        $postData = [ordered]@{ mimeType = $reqCt; text = $reqPayload.Text }
-        if ($reqPayload.Encoding) { $postData['_encoding'] = $reqPayload.Encoding }
-    }
-
-    $status = 0
-    $statusText = ''
-    $respVer = ''
-    $respHeaders = @()
-    $content = [ordered]@{ size = 0; mimeType = ''; text = $null }
-    $bodySize = 0
-    $errText = ''
-    if ($null -ne $RespBytes -and $RespBytes.Length -gt 0) {
-        $resp = Read-SazMessage $RespBytes
-        # Skip interim 1xx responses preceding the final one.
-        while ($resp.FirstLine -match '^HTTP/\S+\s+1\d\d\b' -and $resp.Body.Length -gt 0) { $resp = Read-SazMessage $resp.Body }
-        $sp = $resp.FirstLine.Trim() -split '\s+', 3
-        $respVer = $sp[0]
-        if ($sp.Count -ge 2) { [void][int]::TryParse($sp[1], [ref]$status) }
-        if ($sp.Count -ge 3) { $statusText = $sp[2] }
-        $respHeaders = $resp.Headers
-        $respCt = ''
-        $respCe = ''
-        foreach ($h in $respHeaders) {
-            if ($h['name'] -ieq 'content-type') { $respCt = [string]$h['value'] }
-            if ($h['name'] -ieq 'content-encoding') { $respCe = [string]$h['value'] }
-        }
-        $respBody = $resp.Body
-        if ($method -eq 'CONNECT') { $respBody = [byte[]]@() }
-        $bodySize = $respBody.Length
-        $pl = Get-SazBodyPayload $respBody $respCt $respCe
-        $content = [ordered]@{ size = $respBody.Length; mimeType = $respCt; text = $pl.Text }
-        if ($pl.Encoding) { $content['encoding'] = $pl.Encoding }
-    } else {
-        $errText = 'No response was captured by Fiddler for this session.'
-    }
-
-    $begin = & $T 'ClientBeginRequest'
-    if ($null -eq $begin) { $begin = & $T 'ClientConnected' }
-    if ($null -eq $begin) { $begin = & $T 'FiddlerBeginRequest' }
-    $endT = & $T 'ClientDoneResponse'
-    $total = & $Diff $begin $endT
-    $gotReq = & $T 'ServerGotRequest'
-    $beginResp = & $T 'ServerBeginResponse'
-    $doneResp = & $T 'ServerDoneResponse'
-    $timings = [ordered]@{
-        blocked = 0; dns = (& $Num 'DNSTime'); connect = (& $Num 'TCPConnectTime'); ssl = (& $Num 'HTTPSHandshakeTime')
-        send = (& $Diff (& $T 'FiddlerBeginRequest') $gotReq); wait = (& $Diff $gotReq $beginResp); receive = (& $Diff $beginResp $doneResp)
-    }
-
-    $entry = [ordered]@{}
-    if ($null -ne $begin) { $entry['startedDateTime'] = $begin.ToString('o') }
-    $entry['time'] = $total
-    $entry['request'] = [ordered]@{ method = $method; url = $url; httpVersion = $reqVer; headers = $req.Headers; bodySize = $reqBody.Length }
-    if ($null -ne $postData) { $entry['request']['postData'] = $postData }
-    $entry['response'] = [ordered]@{ status = $status; statusText = $statusText; httpVersion = $respVer; headers = $respHeaders; content = $content; bodySize = $bodySize }
-    $entry['timings'] = $timings
-    if ($flags.ContainsKey('x-hostip')) { $entry['serverIPAddress'] = $flags['x-hostip'] }
-    if ($flags.ContainsKey('x-clientport')) { $entry['connection'] = $flags['x-clientport'] }
-    if ($flags.ContainsKey('x-processinfo')) { $entry['_process'] = $flags['x-processinfo'] }
-    $entry['_fiddlerSession'] = $Id
-    if ($errText) { $entry['_error'] = $errText }
-    if ($null -ne $WsBytes -and $WsBytes.Length -gt 0) { $entry['_webSocketMessages'] = (Read-SazWebSocket $WsBytes $begin) }
-    return $entry
-}
-
-function Read-SazFile {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { New-HarError "SAZ file not found: $Path" 1 }
-    Add-Type -AssemblyName System.IO.Compression
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    try { $zip = [System.IO.Compression.ZipFile]::OpenRead($Path) } catch { New-HarError ("Cannot open '$Path' as a SAZ archive (corrupted, password-protected or not a Fiddler file): " + $_.Exception.Message) 2 }
-    $entries = New-Object 'System.Collections.Generic.List[object]'
-    try {
-        $files = @{}
-        foreach ($z in $zip.Entries) {
-            if ($z.FullName -match '^raw/(\d+)_(c|s|w)\.txt$' -or $z.FullName -match '^raw/(\d+)_(m)\.xml$') { $files[$z.FullName.ToLowerInvariant()] = $z }
-        }
-        $ids = New-Object 'System.Collections.Generic.List[int]'
-        foreach ($k in $files.Keys) { if ($k -match '^raw/(\d+)_c\.txt$') { $ids.Add([int]$Matches[1]) } }
-        if ($ids.Count -eq 0) { New-HarError 'Invalid SAZ: no sessions (raw/NN_c.txt) were found in the archive.' 1 }
-        $ids.Sort()
-        $load = {
-            param($name)
-            $ze = $files[$name]
-            if ($null -eq $ze) { return $null }
-            if ($ze.Length -gt 268435456) { Write-Warning "$name is larger than 256 MB and was skipped."; return $null }
-            $ms = New-Object System.IO.MemoryStream
-            $st = $ze.Open()
-            try { $st.CopyTo($ms) } finally { $st.Dispose() }
-            return , $ms.ToArray()
-        }
-        $total = $ids.Count
-        $n = 0
-        foreach ($id in $ids) {
-            $n++
-            if ($total -gt 50 -and ($n % 25) -eq 0) { Write-Progress -Activity 'Reading SAZ' -Status ("Session {0} of {1}" -f $n, $total) -PercentComplete ([int](100 * $n / $total)) }
-            $pad = $id.ToString()
-            $stem = $null
-            foreach ($cand in @($id.ToString('00'), $pad)) { if ($files.ContainsKey("raw/${cand}_c.txt")) { $stem = $cand; break } }
-            if ($null -eq $stem) {
-                foreach ($k in $files.Keys) { if ($k -match '^raw/(0*)(\d+)_c\.txt$' -and [int]$Matches[2] -eq $id) { $stem = $Matches[1] + $Matches[2]; break } }
-            }
-            try {
-                $c = & $load "raw/${stem}_c.txt"
-                $s = & $load "raw/${stem}_s.txt"
-                $w = & $load "raw/${stem}_w.txt"
-                $mb = & $load "raw/${stem}_m.xml"
-                $mx = ''
-                if ($null -ne $mb) { $mx = (New-Object System.Text.UTF8Encoding($false)).GetString($mb).TrimStart([char]0xFEFF) }
-                if ($null -eq $c -or $c.Length -eq 0) { throw 'empty request file' }
-                $entries.Add((ConvertFrom-SazSession -Id $id.ToString() -ReqBytes $c -RespBytes $s -MetaXml $mx -WsBytes $w))
-            } catch {
-                Write-Warning ("Fiddler session #{0} skipped (malformed): {1}" -f $id, $_.Exception.Message)
-            }
-        }
-        Write-Progress -Activity 'Reading SAZ' -Completed
-    } finally { $zip.Dispose() }
-    return , ([ordered]@{ version = ''; creator = [ordered]@{ name = 'Fiddler (SAZ)'; version = '' }; entries = $entries.ToArray() })
-}
-
-function Test-SazFile {
-    param([string]$Path)
-    if ([System.IO.Path]::GetExtension($Path) -ieq '.saz') { return $true }
-    try {
-        $fs = [System.IO.File]::OpenRead($Path)
-        try { $b = New-Object byte[] 4; $r = $fs.Read($b, 0, 4) } finally { $fs.Dispose() }
-        return ($r -eq 4 -and $b[0] -eq 0x50 -and $b[1] -eq 0x4B -and $b[2] -eq 3 -and $b[3] -eq 4)
-    } catch { return $false }
-}
-#endregion
-
 #region Read-HarFile
 function Read-HarFile {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { New-HarError "HAR file not found: $Path" 1 }
     try { $bytes = [System.IO.File]::ReadAllBytes($Path) } catch { New-HarError ("Cannot read '$Path': " + $_.Exception.Message) 1 }
     if ($bytes.Length -eq 0) { New-HarError "HAR file is empty: $Path" 1 }
+    if ($bytes.Length -ge 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B -and $bytes[2] -eq 3 -and $bytes[3] -eq 4) { New-HarError "Unsupported file: '$Path' is a ZIP-based archive. Only browser .har files are supported." 1 }
     $offset = 0
     if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $offset = 3 }
     $text = (New-Object System.Text.UTF8Encoding($false)).GetString($bytes, $offset, $bytes.Length - $offset)
     $bytes = $null
-    try { $root = ConvertFrom-JsonText $text } catch { New-HarError ("The file is not valid JSON (corrupted or not a HAR file): " + $_.Exception.Message) 2 }
+    try { $root = ConvertFrom-JsonText $text } catch {
+        $parseError = $_.Exception.Message
+        if ($parseError.Length -gt 200) { $parseError = $parseError.Substring(0, 200) + '...' }
+        $root = $null
+        if ('HarSalvage' -as [type]) {
+            $kept = 0
+            $fixed = [HarSalvage]::TruncatedHar($text, [ref]$kept)
+            if ($null -ne $fixed) {
+                try { $root = ConvertFrom-JsonText $fixed } catch { $root = $null }
+                if ($null -ne $root) { Write-Warning ("The HAR file is truncated or corrupted ({0}). Recovered {1} complete entries; the incomplete remainder was discarded. Re-export the HAR for the full trace." -f $parseError, $kept) }
+            }
+        }
+        if ($null -eq $root) { New-HarError ("The file is not valid JSON (corrupted or not a HAR file): " + $parseError) 2 }
+    }
     $text = $null
     if ($null -eq $root -or $root -is [string] -or $root -is [System.Array]) { New-HarError 'Invalid HAR: the JSON root is not an object.' 1 }
     $log = Get-Prop $root 'log'
@@ -4421,8 +4225,22 @@ function New-HtmlReport {
     if ($script:HtmlTemplate.Trim() -eq ('#__HTML_' + 'TEMPLATE__')) { New-HarError 'The embedded HTML template has not been merged into this script (the template placeholder line is still present).' 1 }
     $json = [HarFmt]::ToJson([ordered]@{ meta = $Meta; entries = $Entries })
     $encTitle = [System.Net.WebUtility]::HtmlEncode($ReportTitle)
-    # Title first, data last (ordinal replace) so the payload is never touched by another replacement.
-    return $script:HtmlTemplate.Replace('__REPORT_TITLE__', $encTitle).Replace('__HAR_DATA__', $json)
+    # The CSP only allows this exact script (hash), so injected inline script or handlers cannot run. Line endings are normalised
+    # because the HTML parser does the same before the browser hashes the script text.
+    $tpl = $script:HtmlTemplate
+    $sm = [regex]::Match($tpl, '(?s)<script>(.*?)</script>')
+    if (-not $sm.Success) { New-HarError 'The embedded HTML template does not contain the application script.' 1 }
+    $scriptText = $sm.Groups[1].Value.Replace("`r`n", "`n").Replace("`r", "`n")
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $scriptHash = [System.Convert]::ToBase64String($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($scriptText))) } finally { $sha.Dispose() }
+    $values = @{ '__REPORT_TITLE__' = $encTitle; '__HAR_DATA__' = $json; '__SCRIPT_HASH__' = $scriptHash }
+    # Single pass over the template: inserted values are never scanned again, so a file name or HAR content that
+    # contains a placeholder cannot trigger a second substitution.
+    $sb = New-Object System.Text.StringBuilder ($tpl.Length + $json.Length + 1024)
+    foreach ($piece in [regex]::Split($tpl, '(__REPORT_TITLE__|__HAR_DATA__|__SCRIPT_HASH__)')) {
+        if ($values.ContainsKey($piece)) { [void]$sb.Append($values[$piece]) } else { [void]$sb.Append($piece) }
+    }
+    return $sb.ToString()
 }
 #endregion
 
@@ -4440,6 +4258,8 @@ function Resolve-OutputFile {
     $full = [System.IO.Path]::GetFullPath($full)
     $isDir = (Test-Path -LiteralPath $full -PathType Container) -or $OutputPath.EndsWith('\') -or $OutputPath.EndsWith('/')
     if ($isDir) { return (Join-Path $full $name) }
+    # -Open starts the file with its associated program, so the report must always be an .html file.
+    if ($full -notmatch '(?i)\.html?$') { $full += '.html' }
     return $full
 }
 #endregion
@@ -4450,8 +4270,7 @@ function Invoke-HarConversion {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $leaf = [System.IO.Path]::GetFileName($InFile)
     Write-Verbose "Reading $InFile"
-    $isSaz = Test-SazFile $InFile
-    if ($isSaz) { $log = Read-SazFile $InFile } else { $log = Read-HarFile $InFile }
+    $log = Read-HarFile $InFile
     Write-Stage $sw 'Stage 1/5: input read and validated'
 
     $rawEntries = Get-List (Get-Prop $log 'entries')
@@ -4480,7 +4299,7 @@ function Invoke-HarConversion {
     foreach ($p in (Get-List (Get-Prop $log 'pages'))) {
         if ($null -eq $p) { continue }
         $pd = ConvertTo-HarDate (Get-Prop $p 'startedDateTime')
-        $pages.Add([ordered]@{ id = [string](Get-Prop $p 'id' ''); title = [string](Get-Prop $p 'title' ''); startedDateTime = $(if ($null -ne $pd) { Format-IsoUtc $pd } else { '' }) })
+        $pages.Add([ordered]@{ id = [string](Get-Prop $p 'id' ''); title = $(if ($script:Redact) { Protect-Secrets -Mode Url -Value ([string](Get-Prop $p 'title' '')) } else { [string](Get-Prop $p 'title' '') }); startedDateTime = $(if ($null -ne $pd) { Format-IsoUtc $pd } else { '' }) })
     }
     $minMs = [int64]0
     $maxMs = [int64]0
@@ -4499,7 +4318,7 @@ function Invoke-HarConversion {
         title = $reportTitle
         sourceFile = $leaf
         generatedAt = (Format-IsoUtc ([System.DateTimeOffset]::UtcNow))
-        harVersion = $(if ($isSaz) { 'n/a (Fiddler SAZ)' } else { [string](Get-Prop $log 'version' '') })
+        harVersion = [string](Get-Prop $log 'version' '')
         creator = (& $nv $creator)
         browser = (& $nv $browser)
         captureStart = (& $iso $minMs)
@@ -4525,7 +4344,7 @@ function Invoke-HarConversion {
     Write-Host ("  Errors  : {0} (4xx/5xx/failed)" -f $errCount)
     Write-Host ("  Output  : {0}" -f $out)
     Write-Host ("  Time    : {0:N2} s" -f $sw.Elapsed.TotalSeconds)
-    if ($OpenReport) {
+    if ($Open) {
         try { Start-Process -FilePath $out } catch { Write-Warning ("Could not open the report automatically: " + $_.Exception.Message) }
     }
 }

@@ -19,11 +19,13 @@ A PowerShell tool that converts a browser **HAR trace** (Edge, Chrome, Firefox o
 
 ## Key Features
 
-- **Session-based UI:** sessions grid with per-column filters, plus Request and Response inspectors (Headers, TextView, WebForms, JSON, XML, Cookies, Auth, SAML, Raw, Hex, Preview, Timing).
-- **Full decoding:** base64, gzip/deflate/brotli, URL-encoded forms, multipart, JSON, XML, JWT, SAML, cookies and binary (hex view).
+- **Session-based UI:** left tabs (Sessions, Summary, Timeline, Insights, Capture info), a sessions grid with per-column filters, and Request and Response inspectors (Headers, TextView, WebForms, JSON, XML, Cookies, Auth, SAML, Raw, Hex, Preview, Timing, Redirects, Caching, WebSocket).
+- **Full decoding:** base64, gzip/deflate/brotli (brotli on PowerShell 7+), URL-encoded forms, multipart, JSON, XML, JWT, SAML, cookies, WebSocket frames and binary (hex view).
 - **Global search** across URLs, headers and bodies with yellow row highlighting and next/previous navigation.
 - **Insights:** HTTP errors, failed requests, AADSTS codes, OAuth errors, expired JWTs, CORS issues, slow TTFB, redirect loops and more.
-- **Troubleshooting tools:** summary dashboard, waterfall timeline, redirect chains, correlation IDs, session compare, export (CSV, TXT, HAR), copy as cURL/PowerShell.
+- **Troubleshooting tools:** summary dashboard, waterfall timeline, redirect chains, correlation IDs (**Correlation ID** and **x-ms-request-id** columns, hidden by default and enabled via **Columns**; the Correlation ID column also picks up `correlationId` GUIDs from response and request bodies), session compare, export (CSV, session text, HAR), and a right-click menu with Copy as cURL (bash), Copy as cURL (PowerShell) and Copy as PowerShell.
+- **Find in pane:** a search box above each Request and Response pane highlights matches in the open tab in yellow (Enter = next, Shift+Enter = previous, Esc = clear).
+- **Damaged HAR recovery:** if a HAR file is truncated, the entries up to the last complete one are still converted and a warning is shown.
 - **Single file output:** all CSS, JavaScript and data are embedded. No internet access or external libraries needed.
 
 ## How It Works
@@ -52,10 +54,10 @@ flowchart LR
 
 **Choose the output folder and open the report when done:**
 ```powershell
-.\HAR2HTML.ps1 -HarPath "C:\temp\trace.har" -OutPut "C:\temp\Reports" -Open
+.\HAR2HTML.ps1 -HarPath "C:\temp\trace.har" -OutputPath "C:\temp\Reports" -Open
 ```
 
-**Mask secrets for sharing:**
+**Mask secrets for sharing (permanent, cannot be undone in the report):**
 ```powershell
 .\HAR2HTML.ps1 -HarPath "C:\temp\trace.har" -RedactSecrets
 ```
@@ -64,23 +66,24 @@ flowchart LR
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `-HarPath` | string | Path to a single `.har` file. Required. |
-| `-OutputPath` | string | Folder (or file path) for the HTML report. Alias: `-OutPut`. Defaults to the HAR file's folder. |
-| `-OpenReport` | switch | Opens the report in the default browser when finished. Alias: `-Open`. |
-| `-RedactSecrets` | switch | Masks authorization headers, cookies, tokens, passwords, client secrets and SAML assertions. |
+| `-HarPath` | string | Path to a single `.har` file. Required. Alias: `-Path`. ZIP-based archives (for example `.saz`) are rejected. |
+| `-OutputPath` | string | Folder or file path for the HTML report. Aliases: `-OutPut`, `-OutputFolder`, `-OutDir`. Defaults to the HAR file's folder. A file path without `.htm` or `.html` gets `.html` appended. |
+| `-Open` | switch | Opens the report in the default browser when finished. |
+| `-RedactSecrets` | switch | Permanently masks authorization headers, cookies, tokens, passwords, client secrets and SAML assertions while the report is generated. Without it, nothing is masked. |
 
 ## Output
 
-The report is saved as `<HarName>_Report_<yyyyMMdd_HHmmss>.html` and shows the generation time in its header. The console prints the number of entries, the error count (4xx/5xx/failed), the output path and the processing time.
+The report is saved as `<HarName>_Report_<yyyyMMdd_HHmmss>.html` (or under the exact file name when `-OutputPath` is a file) and shows the generation time in its header. The console prints the number of entries, the error count (4xx/5xx/failed), the output path and the processing time.
 
-Exit codes: `0` success, `1` invalid input, `2` parse failure.
+Exit codes: `0` success, `1` invalid input (missing, empty, ZIP-based archive, not a HAR, or unsupported HAR version), `2` parse or conversion failure (for example invalid JSON). Errors are printed as `ERROR: ...`.
 
 ## Security & Privacy
 
-- HAR content is treated as untrusted: everything rendered is HTML-escaped, the report uses a Content Security Policy, and HTML previews run in a sandboxed iframe.
+- HAR content is treated as untrusted: everything rendered is HTML-escaped, the report uses a Content Security Policy that allows only its own script (by SHA-256 hash) and sets `form-action 'none'` and `base-uri 'none'`, and HTML previews run in a sandboxed iframe.
 - The script makes no network calls. Its only output is the HTML report.
-- Bodies larger than 5 MB are truncated in the report.
-- **HAR files and reports may contain sensitive data** (tokens, cookies, personal data). Use `-RedactSecrets` and share them only through approved channels.
+- Text bodies larger than 5 MB are truncated in the report; larger binary bodies are not embedded.
+- **Without `-RedactSecrets` the report contains passwords, tokens, cookies and secrets unmasked.** With it, secrets are masked at generation time (short values and all passwords and secrets are masked completely, longer values keep at most 4 characters at each end) and the original values are not stored in the file, so they cannot be revealed later. There is no on-screen redact button. Insight texts, error text and page titles are masked too, and decoded JWT claims and SAML XML are withheld. Masking is name-based, so check a redacted report before sharing it.
+- **HAR files and reports may contain sensitive data** (tokens, cookies, personal data). Use `-RedactSecrets` before sharing and share them only through approved channels.
 
 ## Disclaimer
 
